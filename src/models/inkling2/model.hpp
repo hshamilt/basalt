@@ -8,6 +8,7 @@
 #include "basalt/model/adapter.hpp"
 #include "basalt/model/peer_hooks.hpp"
 #include "basalt/model/split_hooks.hpp"
+#include "basalt/models/inkling2/kernels.hpp"   // the KV cache formats
 #include "models/inkling2/dspark.hpp"   // DSPARK HOOK
 #include "models/inkling2/pack.hpp"
 #include "models/inkling2/spill.hpp"
@@ -80,16 +81,26 @@ public:
     /// a card that runs no core layer)
     const float* msg_queries(int card = 0) const { return msg_queries_[card]; }
     int device() const { return device_; }
+    /// The disk conversation namespace suffix for the engine's KV formats ("": the legacy namespace): the cell-layout
+    /// version, the effective layer split (the running-state region order changes with placement) and the drafter's
+    /// running-state layout.
+    std::string disk_identity_suffix() const override {
+        if (kv_full_ != KVFormat::Mxfp8) return "";
+        std::string s = "mxfp8v1 cut=" + std::to_string(cut_) + " drafter=" + (dspark_ ? std::to_string(1) : std::to_string(0));
+        return s;
+    }
     /// The layer split (docs/configuration/gpus.md): with two cards the second runs layers [cut, n_layers) with their
     /// weights, experts and caches; the first runs the rest, the embedding, the head and the drafter. One card: card 0.
     int cards() const { return cut_ > 0 ? 2 : 1; }
     int card_of(int layer) const { return cut_ > 0 && layer >= cut_ ? 1 : 0; }
     int card_device(int card) const { return card == 0 ? device_ : second_; }
     int split_cut() const { return cut_; }
+    /// The KV-cache formats of the visits: a full-attention visit's, and a sliding-window ring's (a ring never takes MXFP8).
+    KVFormat full_format() const { return kv_full_; }
+    KVFormat ring_format() const { return kv_ring_; }
     int sessions() const { return flags_.sessions > 0 ? flags_.sessions : 1; }
     const model::LoadRequest& flags() const { return flags_; }
-    bool cache_fp8() const { return fp8_; }
-    bool cache_int8() const { return int8_; }
+
     /// [vision] The image encoder: staged with --vision, else it refuses pictures. One per model; ENC runs between requests
     /// and windows, so nothing reads the experts while it holds their memory (lend_room).
     ImageEncoder& encoder() const { return vis_; }
@@ -198,7 +209,9 @@ private:
     model::LoadRequest flags_;
     int device_ = 0, fd_ = -1;
     int ldev_ = 0;                           ///< the card the weights being planned load to
-    bool fp8_ = false, int8_ = false;
+    bool cache_fp8() const { return kv_full_ == KVFormat::Fp8; }
+    bool cache_int8() const { return kv_full_ == KVFormat::Int8; }
+    KVFormat kv_full_ = KVFormat::Fp16, kv_ring_ = KVFormat::Fp16;
     int64_t ctx_ = kDefaultContext;
     mutable ImageEncoder vis_;   // [vision]
     std::unique_ptr<DsparkWeights> dspark_;   // DSPARK HOOK
@@ -244,9 +257,9 @@ private:
 /// A session over `model`; null with `err` set.
 std::unique_ptr<model::ModelSession> make_session(InklingModel& model, std::string& err);
 
-/// The device bytes a session takes for `context` positions in the selected KV cache format, its drafter aside, on card
+/// The device bytes a session takes for `context` positions (the formats of the visits), its drafter aside, on card
 /// `card` of a split at `cut` (0: one card, every visit).
-uint64_t session_bytes(const Geometry& g, int64_t context, bool fp8, bool int8, int cut = 0, int card = 0);
+uint64_t session_bytes(const Geometry& g, int64_t context, KVFormat full, KVFormat ring, int cut = 0, int card = 0);
 /// The device bytes every session shares once on a card: the forward's scratch, the prompt path, the drafter's tap (the
 /// first card's).
 uint64_t shared_bytes(const Geometry& g, bool drafter);

@@ -3,6 +3,7 @@
 // row (warps 0 and 1), and its three query heads' clipped queries, relative states and sinks (warps 2 and 3).
 #pragma once
 
+#include "basalt/models/inkling2/kv_row_codec.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
 
 #include <cuda_fp16.h>
@@ -104,7 +105,7 @@ __device__ __forceinline__ void kv_row(const AttnPrep& a, int r, int pr, int g, 
     }
     ss = warp_sum(ss);
     f = w == 0 ? fminf(a.qk_clip / (sqrtf(ss) + 1e-6f), 1.f) : rsqrtf(ss / (float) kHeadDim + a.eps);
-    if (a.int8) int8_scales(val, f, lane, scale);
+    if (a.format == KVFormat::Int8) int8_scales(val, f, lane, scale);
 }
 
 // kv_row for the n (1..N) consecutive rows r0.. at positions pr0.., every input loaded before the first sum (a row's older
@@ -152,26 +153,30 @@ __device__ __forceinline__ void kv_rows(const AttnPrep& a, int r0, int n, int pr
         }
         ss = warp_sum(ss);
         f[k] = w == 0 ? fminf(a.qk_clip / (sqrtf(ss) + 1e-6f), 1.f) : rsqrtf(ss / (float) kHeadDim + a.eps);
-        if (a.int8) int8_scales(val[k], f[k], lane, scale[k]);
+        if (a.format == KVFormat::Int8) int8_scales(val[k], f[k], lane, scale[k]);
     }
 }
 
-__device__ __forceinline__ void store_kv(void* row, bool fp8, bool int8, size_t idx, float v, const float (&scale)[2], int lane) {
-    if (int8) {
-        const int group = (int) idx / 64;
+/// One value into the cache at `byte_idx` (bytes; the int8 row is 1 byte per value). fp16 writes 2 bytes, unit-scale
+/// E4M3 and int8 one; int8 also writes the half scale at channel 128 and the padding zeros on its last channel.
+template <KVFormat F>
+__device__ __forceinline__ void store_kv(void* row, size_t byte_idx, float v, const float (&scale)[2] = {1.f, 1.f}, int lane = 0) {
+    if constexpr (F == KVFormat::Fp16) {
+        *reinterpret_cast<__half*>(static_cast<uint8_t*>(row) + byte_idx) = __float2half_rn(v);
+    } else if constexpr (F == KVFormat::Fp8) {
+        __nv_fp8_e4m3 q(v);
+        static_cast<uint8_t*>(row)[byte_idx] = *reinterpret_cast<uint8_t*>(&q);
+    } else if constexpr (F == KVFormat::Int8) {
+        const int group = (int) byte_idx / 64;
         const float s = scale[group];
         const int q = s > 0.f ? max(-127, min(127, __float2int_rn(v / s))) : 0;
-        static_cast<int8_t*>(row)[idx] = (int8_t) q;
+        static_cast<int8_t*>(row)[byte_idx] = (int8_t) q;
         if (lane == group * 16)
             reinterpret_cast<__half*>(static_cast<uint8_t*>(row) + kHeadDim)[group] = __float2half_rn(s);
-        if (idx == kHeadDim - 1)   // the last channel writes the row padding as zeros
+        if (byte_idx == kHeadDim - 1)   // the last channel writes the row padding as zeros
             for (int b = kHeadDim + 4; b < kKvInt8RowBytes; b += 4) *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(row) + b) = 0u;
-    } else if (fp8) {
-        __nv_fp8_e4m3 q(v);
-        static_cast<uint8_t*>(row)[idx] = *reinterpret_cast<uint8_t*>(&q);
-    } else {
-        static_cast<__half*>(row)[idx] = __float2half_rn(v);
     }
+    // mxfp8: never goes through store_kv (the fused encode is mxfp8_encode_row)
 }
 
 // Warps 2 and 3 of head g for row r at position p: the clipped (and scaled) queries of heads 3g..3g+2 into q3

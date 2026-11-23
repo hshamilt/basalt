@@ -304,6 +304,10 @@ public:
     /// Card `card`'s part of a several-card run once loaded (0 = the main card), for the start line after the load
     /// (model/multi_gpu.hpp gpu_parts_line): the peer's report when the model has one; empty: nothing to say.
     virtual std::string gpu_report(int card) const { return peer() ? peer()->peer_report((size_t) card) : std::string(); }
+    /// The conversation disk namespace suffix for the engine's current settings ("": the legacy namespace, which this
+    /// model does not separate).  Includes the layout version, the effective placement and the drafter's layout: a parked
+    /// conversation is written under this suffix and is never restored under another.
+    virtual std::string disk_identity_suffix() const { return ""; }
 };
 
 /// A started model and its sessions.

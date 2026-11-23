@@ -9,6 +9,7 @@
 // kDecodeRows rows touches distinct slots (kDecodeRows + kConv - 1 <= kConvRing).
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
+#include "basalt/models/inkling2/kv_row_codec.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
 #include "prep.cuh"
 
@@ -469,6 +470,7 @@ __global__ void __launch_bounds__(kThreads) ctrl_blend_kernel(CtrlArgs a) {
 
 // Block (row, key/value head g), four warps: warp 0 the head's keys (convolved, clipped, cached; the raw inputs into the
 // ring), warp 1 its values (normed), warps 2 and 3 its three query heads, their relative states and sinks (prep.cuh).
+template <KVFormat F>
 __global__ void __launch_bounds__(128) prepare_kernel(AttnPrep a) {
     const int r = blockIdx.x, g = blockIdx.y, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
     float wt[4][kConv];   // the weights, read while the kernel before finishes
@@ -485,10 +487,22 @@ __global__ void __launch_bounds__(128) prepare_kernel(AttnPrep a) {
         void* cache = w ? (b ? sc.v : a.v_cache) : (b ? sc.k : a.k_cache);
         float val[4], raw[4], f, scale[2] = {};
         prep::kv_row(a, r, p, g, w, lane, wt, val, raw, f, ring, b ? a.seg.at.row0[k] : 0, scale);
-        const size_t row_bytes = a.fp8 ? kHeadDim : a.int8 ? kKvInt8RowBytes : 2 * kHeadDim;
-        void* row = static_cast<uint8_t*>(cache) + ((size_t) (p % a.cap) * kKvHeads + g) * row_bytes;
+        const int64_t cell = p % a.cap;
+        const size_t cell_base = (size_t) cell * cell_bytes(F) + (size_t) g * head_code_bytes(F);
+        float vals[4] = {val[0] * f, val[1] * f, val[2] * f, val[3] * f};
+        if constexpr (F == KVFormat::Int8) {
 #pragma unroll
-        for (int u = 0; u < 4; ++u) prep::store_kv(row, a.fp8, a.int8, lane * 4 + u, val[u] * f, scale, lane);
+            for (int u = 0; u < 4; ++u)
+                prep::store_kv<KVFormat::Int8>((uint8_t*) cache + cell_base, (size_t) lane * 4 + u, vals[u], scale, lane);
+        } else if constexpr (F == KVFormat::Fp16) {
+            for (int u = 0; u < 4; ++u) prep::store_kv<F>(cache, cell_base + lane * 8 + u * 2, vals[u]);
+        } else if constexpr (F == KVFormat::Fp8) {
+            for (int u = 0; u < 4; ++u) prep::store_kv<F>(cache, cell_base + lane * 4 + u, vals[u]);
+        } else {   // MXFP8: the row's codes then the four group scales
+            uint8_t* codes = (uint8_t*) cache + cell_base;
+            uint8_t* scales = (uint8_t*) cache + (size_t) cell * cell_bytes(F) + scales_offset(F, g);
+            mxfp8_encode_row(vals, codes, scales, lane);
+        }
         *reinterpret_cast<float4*>(ring + (size_t) (p % kConvRing) * (kKvHeads * kHeadDim) + g * kHeadDim + lane * 4) =
             make_float4(raw[0], raw[1], raw[2], raw[3]);
         return;
@@ -654,7 +668,13 @@ void controllers(const CtrlArgs& a, int streams, int rows, void* stream) {
 void decode_prepare(const AttnPrep& a, int rows, void* stream) {
     if (rows <= 0) return;
     check_rows(rows, "decode_prepare");
-    bk::launch_pdl(prepare_kernel, dim3((unsigned) rows, kKvHeads), dim3(128), 0, (cudaStream_t) stream, a);
+    cudaStream_t s = (cudaStream_t) stream;
+    switch (a.format) {
+    case KVFormat::Fp16:  bk::launch_pdl(prepare_kernel<KVFormat::Fp16>, dim3((unsigned) rows, kKvHeads), dim3(128), 0, s, a); break;
+    case KVFormat::Fp8:   bk::launch_pdl(prepare_kernel<KVFormat::Fp8>, dim3((unsigned) rows, kKvHeads), dim3(128), 0, s, a); break;
+    case KVFormat::Int8:  bk::launch_pdl(prepare_kernel<KVFormat::Int8>, dim3((unsigned) rows, kKvHeads), dim3(128), 0, s, a); break;
+    case KVFormat::Mxfp8: bk::launch_pdl(prepare_kernel<KVFormat::Mxfp8>, dim3((unsigned) rows, kKvHeads), dim3(128), 0, s, a); break;
+    }
     check("decode_prepare");
 }
 

@@ -113,84 +113,184 @@ double e42d(uint8_t c) {
 }
 double sig(double x) { return 1.0 / (1.0 + std::exp(-x)); }
 
-// ---- attention -----------------------------------------------------------------------------------------------------------
+// ---- attention ────────────────────────────────────────────────────────────────────────-----------------------------------
 
-// The cache formats: fp16, E4M3 codes (fp8), INT8 codes with an fp16 scale per 64 channels (int8).
-enum Kv { kF16, kE4M3, kI8 };
-size_t kv_bytes(Kv kv) { return (size_t) kv_cache_row_bytes(kv == kE4M3, kv == kI8); }
-const char* kv_name(Kv kv) { return kv == kE4M3 ? "e4m3" : kv == kI8 ? "int8" : "fp16"; }
-// One head row of kHeadDim values `x` written in format kv to `row` (kv_bytes(kv) bytes); `got` takes the values the row
-// holds. INT8: each 64 channels' scale the fp16 rounding of their max |x| / 127, codes x / scale rounded to nearest even.
-void put_row(Kv kv, const float* x, uint8_t* row, double* got) {
-    if (kv == kI8) {
-        for (int grp = 0; grp < 2; ++grp) {
-            float m = 0.f;
-            for (int d = grp * 64; d < grp * 64 + 64; ++d) m = std::max(m, std::fabs(x[d]));
-            const uint16_t sh = f2h(m / 127.f);
-            const float sc = (float) h2d(sh);
-            std::memcpy(row + kHeadDim + 2 * grp, &sh, 2);
-            for (int d = grp * 64; d < grp * 64 + 64; ++d) {
-                const int q = sc > 0.f ? std::clamp((int) std::nearbyint(x[d] / sc), -127, 127) : 0;
-                row[d] = (uint8_t) (int8_t) q;
-                got[d] = (double) q * sc;
-            }
-        }
-    } else {
-        for (int d = 0; d < kHeadDim; ++d) {
-            if (kv == kE4M3) {
-                row[d] = f2e4(x[d]);
-                got[d] = e42d(row[d]);
-            } else {
-                const uint16_t h = f2h(x[d]);
-                std::memcpy(row + 2 * d, &h, 2);
-                got[d] = h2d(h);
-            }
-        }
+static const char* fmt_name(KVFormat fmt) {
+    switch (fmt) {
+        case KVFormat::Fp16: return "fp16";
+        case KVFormat::Fp8: return "e4m3";
+        case KVFormat::Int8: return "int8";
+        default: return "mxfp8";
     }
 }
-
-// A cache of `cap` cells ([cell][kKvHeads] rows) holding positions [lo, hi) in cell p % cap: a row per (head, position),
-// the same at every place a position is stored, in format kv.
+// The MXFP8/INT8 oracle: the same rules the kernel writes (basalt/models/inkling2/kv_row_codec.hpp), scalar
+static uint8_t mxfp8_exponent(float amax, bool bad) {
+    if (bad || !std::isfinite(amax) || amax < 0.f) return 255;
+    const float raw = amax * (1.0f / 448.0f);
+    if (raw <= std::ldexp(1.0f, -127)) return 0;
+    uint32_t bits;
+    std::memcpy(&bits, &raw, 4);
+    const uint32_t e = ((bits + 0x007FFFFFu) & 0x7F800000u) >> 23;
+    return (uint8_t) std::min<uint32_t>(e, 254u);
+}
+static double mxfp8_decode(uint8_t code, uint8_t e) {
+    if (e == 255) return std::numeric_limits<double>::quiet_NaN();
+    const int sign = (code & 0x80) ? 1 : 0;
+    const uint8_t mag = code & 0x7F;
+    const int exp = (mag >> 3) & 0x0F, mant = mag & 0x07;
+    double v;
+    if (exp == 0) v = mant * std::ldexp(1.0, -9);
+    else if (exp == 0x0F && mant == 7) v = std::numeric_limits<double>::quiet_NaN();
+    else v = (1.0 + mant / 8.0) * std::ldexp(1.0, exp - 7);
+    if (sign) v = -v;
+    return v * std::ldexp(1.0, int(e) - 127);
+}
+// One (head, position) cell of a full-attention cache: fp16 codes, E4M3 codes, INT8 codes with an fp16 scale per 64
+// channels, or MXFP8 codes plus the per-group scales — the bits an attention call takes to produce, and what the CPU
+// reference decodes.
 struct KeyBank {
-    Kv kv = kF16;
-    std::vector<uint8_t> k, v;   // [kKvHeads][positions] rows for positions [0, hi)
-    std::vector<double> kd, vd;  // the values they hold, [kKvHeads][positions][kHeadDim]
+    std::vector<float> k, v;   // [kKvHeads][positions][kHeadDim] for positions [0, hi)
     int64_t hi = 0;
-    void make(Kv f, int64_t n) {
-        kv = f;
+    void make(int64_t n) {
         hi = n;
-        const size_t rows = (size_t) kKvHeads * n;
-        k.assign(rows * kv_bytes(kv), 0);
-        v.assign(rows * kv_bytes(kv), 0);
-        kd.resize(rows * kHeadDim);
-        vd.resize(rows * kHeadDim);
-        for (size_t i = 0; i < rows; ++i) {
-            const std::vector<float> kf = randn(kHeadDim, 0.6f), vf = randn(kHeadDim, 1.0f);
-            put_row(kv, kf.data(), &k[i * kv_bytes(kv)], &kd[i * kHeadDim]);
-            put_row(kv, vf.data(), &v[i * kv_bytes(kv)], &vd[i * kHeadDim]);
-        }
+        k = randn((size_t) kKvHeads * n * kHeadDim, 0.6f);
+        v = randn((size_t) kKvHeads * n * kHeadDim, 1.0f);
     }
-    double key(int h, int64_t p, int d) const { return kd[((size_t) h * hi + p) * kHeadDim + d]; }
-    double val(int h, int64_t p, int d) const { return vd[((size_t) h * hi + p) * kHeadDim + d]; }
+    double key(KVFormat fmt, int h, int64_t p, int d) const {
+        const float x = k[((size_t) h * hi + p) * kHeadDim + d];
+        if (fmt == KVFormat::Fp16) return h2d(f2h(x));
+        if (fmt == KVFormat::Fp8) return e42d(f2e4(x));
+        if (fmt == KVFormat::Int8) return int8_val(k, h, p, d);
+        return round_mxfp8(k, h, p, d);
+    }
+    double val(KVFormat fmt, int h, int64_t p, int d) const {
+        const float x = v[((size_t) h * hi + p) * kHeadDim + d];
+        if (fmt == KVFormat::Fp16) return h2d(f2h(x));
+        if (fmt == KVFormat::Fp8) return e42d(f2e4(x));
+        if (fmt == KVFormat::Int8) return int8_val(v, h, p, d);
+        return round_mxfp8(v, h, p, d);
+    }
+    // INT8: each 64 channels' scale the fp16 rounding of their max |x| / 127, codes x / scale rounded to nearest even
+    double int8_val(const std::vector<float>& src, int h, int64_t p, int d) const {
+        const int g = d / 64;
+        const int base = ((size_t) h * hi + p) * kHeadDim;
+        float m = 0.f;
+        for (int i = g * 64; i < (g + 1) * 64; ++i) m = std::max(m, std::fabs(src[base + i]));
+        const uint16_t sh = f2h(m / 127.f);
+        const float sc = (float) h2d(sh);
+        const int q = sc > 0.f ? std::clamp((int) std::nearbyint(src[base + d] / sc), -127, 127) : 0;
+        return (double) q * sc;
+    }
+    // the value the cache holds for (h,p,d): encode the group exactly as the kernel does, then decode the code for this
+    // value — the same bits the device would store and read back
+    double round_mxfp8(const std::vector<float>& src, int h, int64_t p, int d) const {
+        const int g = d / kMxfp8GroupSize;
+        float vals[32];
+        float amax = 0.f;
+        bool bad = false;
+        for (int i = 0; i < 32; ++i) {
+            vals[i] = src[((size_t) h * hi + p) * kHeadDim + g * 32 + i];
+            if (!std::isfinite(vals[i])) bad = true;
+            amax = std::max(amax, std::fabs(vals[i]));
+        }
+        const uint8_t e = mxfp8_exponent(amax, bad);
+        if (e == 255) return std::numeric_limits<double>::quiet_NaN();
+        const float inv = std::ldexp(1.0f, 127 - (int) e);
+        const float v = std::min(std::max(vals[d - g * 32] * inv, -448.0f), 448.0f);
+        return mxfp8_decode(f2e4(v), e);
+    }
     // the cache bytes of positions [lo, hi2) at p % cap
-    std::vector<uint8_t> cache(bool keys, int64_t cap, int64_t lo, int64_t hi2) const {
-        const size_t rb = kv_bytes(kv);
-        std::vector<uint8_t> out((size_t) kKvHeads * cap * rb, 0);
-        const std::vector<uint8_t>& src = keys ? k : v;
+    std::vector<uint8_t> cache(KVFormat fmt, bool keys, int64_t cap, int64_t lo, int64_t hi2) const {
+        const std::vector<float>& src = keys ? k : v;
+        if (fmt == KVFormat::Fp16) {
+            std::vector<uint8_t> out((size_t) kKvHeads * cap * kHeadDim * 2, 0);
+            for (int h = 0; h < kKvHeads; ++h)
+                for (int64_t p = lo; p < hi2; ++p)
+                    for (int d = 0; d < kHeadDim; ++d) {
+                        const float x = src[((size_t) h * hi + p) * kHeadDim + d];
+                        const uint16_t hv = f2h(x);
+                        std::memcpy(&out[(((size_t) (p % cap) * kKvHeads + h) * kHeadDim + d) * 2], &hv, 2);
+                    }
+            return out;
+        }
+        if (fmt == KVFormat::Fp8) {
+            std::vector<uint8_t> out((size_t) kKvHeads * cap * kHeadDim, 0);
+            for (int h = 0; h < kKvHeads; ++h)
+                for (int64_t p = lo; p < hi2; ++p)
+                    for (int d = 0; d < kHeadDim; ++d) {
+                        const float x = src[((size_t) h * hi + p) * kHeadDim + d];
+                        out[((size_t) (p % cap) * kKvHeads + h) * kHeadDim + d] = f2e4(x);
+                    }
+            return out;
+        }
+        if (fmt == KVFormat::Int8) {
+            // [cap][cell_bytes(Int8)] cells — one 128-code row and two fp16 scales per head, padding zeros
+            const size_t row_bytes = head_code_bytes(KVFormat::Int8);
+            std::vector<uint8_t> out((size_t) cap * cell_bytes(KVFormat::Int8), 0);
+            for (int h = 0; h < kKvHeads; ++h)
+                for (int64_t p = lo; p < hi2; ++p) {
+                    uint8_t* row = out.data() + (size_t) (p % cap) * cell_bytes(KVFormat::Int8) + (size_t) h * row_bytes;
+                    const int base = ((size_t) h * hi + p) * kHeadDim;
+                    for (int grp = 0; grp < 2; ++grp) {
+                        float m = 0.f;
+                        for (int d = grp * 64; d < (grp + 1) * 64; ++d) m = std::max(m, std::fabs(src[base + d]));
+                        const uint16_t sh = f2h(m / 127.f);
+                        const float sc = (float) h2d(sh);
+                        std::memcpy(row + kHeadDim + 2 * grp, &sh, 2);
+                        for (int d = grp * 64; d < (grp + 1) * 64; ++d) {
+                            const float x = src[base + d];
+                            const int q = sc > 0.f ? std::clamp((int) std::nearbyint(x / sc), -127, 127) : 0;
+                            row[d] = (uint8_t) (int8_t) q;
+                        }
+                    }
+                }
+            return out;
+        }
+        // MXFP8: [cap][1056-byte cells] — one 128-code row and four exponent bytes per head
+        std::vector<uint8_t> out((size_t) cap * cell_bytes(KVFormat::Mxfp8), 0);
         for (int h = 0; h < kKvHeads; ++h)
-            for (int64_t p = lo; p < hi2; ++p)
-                std::memcpy(&out[((size_t) (p % cap) * kKvHeads + h) * rb], &src[((size_t) h * hi + p) * rb], rb);
+            for (int64_t p = lo; p < hi2; ++p) {
+                uint8_t* cell = out.data() + (size_t) (p % cap) * cell_bytes(KVFormat::Mxfp8);
+                uint8_t* codes = cell + codes_offset(KVFormat::Mxfp8, h);
+                uint8_t* scales = cell + scales_offset(KVFormat::Mxfp8, h);
+                for (int g = 0; g < 4; ++g) {
+                    float vals[32];
+                    float amax = 0.f;
+                    bool bad = false;
+                    for (int i = 0; i < 32; ++i) {
+                        vals[i] = src[((size_t) h * hi + p) * kHeadDim + g * 32 + i];
+                        if (!std::isfinite(vals[i])) bad = true;
+                        amax = std::max(amax, std::fabs(vals[i]));
+                    }
+                    const uint8_t e = mxfp8_exponent(amax, bad);
+                    scales[g] = e;
+                    const float inv = (e == 255 || e == 0) ? 0.f : std::ldexp(1.0f, 127 - (int) e);
+                    for (int i = 0; i < 32; ++i) {
+                        uint8_t code = 0;
+                        if (e != 255 && !bad) {
+                            const float v = std::min(std::max(vals[i] * inv, -448.0f), 448.0f);
+                            code = f2e4(v);
+                        }
+                        codes[g * 32 + i] = code;
+                    }
+                }
+            }
         return out;
     }
 };
 
 void test_attention_prompt() {
-    for (const Kv kv : {kF16, kE4M3, kI8})
+    for (const KVFormat fmt : {KVFormat::Fp16, KVFormat::Fp8, KVFormat::Int8, KVFormat::Mxfp8})
         for (const bool window : {true, false}) {
+            // the window visits keep the engine's effective ring format (fp16 or unit-scale E4M3); the full visits
+            // take the selected format
+            const KVFormat ring_fmt = fmt == KVFormat::Fp16 ? KVFormat::Fp16
+                                      : fmt == KVFormat::Int8 ? KVFormat::Int8 : KVFormat::Fp8;
+            const KVFormat cache_fmt = window ? ring_fmt : fmt;
             const int R = 300;
             const int64_t pos0 = window ? 2500 : 3000;
             KeyBank kb;
-            kb.make(kv, pos0 + R);
+            kb.make(pos0 + R);
             const std::vector<float> q = randn((size_t) R * kHeads * kHeadDim, 0.8f), rs = randn((size_t) R * kHeads * kRel, 1.0f);
             const std::vector<float> sink = randn((size_t) R * kHeads, 2.0f), table = randn((size_t) kRel * kExtent, 0.3f);
             // the window layer: a ring of the window and 64 cells holding the keys before the chunk (and the chunk's first 37,
@@ -198,13 +298,13 @@ void test_attention_prompt() {
             const int64_t ring_cap = kExtent + 64, stage_cap = 512, full_cap = 4096;
             std::vector<uint8_t> kc, vc, ks, vs;
             if (window) {
-                kc = kb.cache(true, ring_cap, std::max<int64_t>(0, pos0 + 37 - ring_cap), pos0 + 37);
-                vc = kb.cache(false, ring_cap, std::max<int64_t>(0, pos0 + 37 - ring_cap), pos0 + 37);
-                ks = kb.cache(true, stage_cap, pos0, pos0 + R);
-                vs = kb.cache(false, stage_cap, pos0, pos0 + R);
+                kc = kb.cache(cache_fmt, true, ring_cap, std::max<int64_t>(0, pos0 + 37 - ring_cap), pos0 + 37);
+                vc = kb.cache(cache_fmt, false, ring_cap, std::max<int64_t>(0, pos0 + 37 - ring_cap), pos0 + 37);
+                ks = kb.cache(cache_fmt, true, stage_cap, pos0, pos0 + R);
+                vs = kb.cache(cache_fmt, false, stage_cap, pos0, pos0 + R);
             } else {
-                kc = kb.cache(true, full_cap, 0, pos0 + R);
-                vc = kb.cache(false, full_cap, 0, pos0 + R);
+                kc = kb.cache(cache_fmt, true, full_cap, 0, pos0 + R);
+                vc = kb.cache(cache_fmt, false, full_cap, 0, pos0 + R);
             }
             uint8_t *dkc = dev(kc), *dvc = dev(vc), *dks = window ? dev(ks) : dkc, *dvs = window ? dev(vs) : dvc;
             float *dq = dev(q), *drs = dev(rs), *dsink = dev(sink), *dt = dev(table);
@@ -221,8 +321,7 @@ void test_attention_prompt() {
             a.k_chunk = dks;
             a.v_chunk = dvs;
             a.chunk_cap = window ? stage_cap : full_cap;
-            a.fp8 = kv == kE4M3;
-            a.int8 = kv == kI8;
+            a.format = cache_fmt;
             a.window = window ? kExtent : 0;
             attention_prompt(a, R, out, S);
             const std::vector<float> got = host(out, (size_t) R * kHeads * kHeadDim);
@@ -237,7 +336,7 @@ void test_attention_prompt() {
                     double m = sink[(size_t) r * kHeads + h];
                     for (int64_t key = lo; key <= p; ++key) {
                         double d = 0;
-                        for (int i = 0; i < kHeadDim; ++i) d += (double) q[((size_t) r * kHeads + h) * kHeadDim + i] * kb.key(g, key, i);
+                        for (int i = 0; i < kHeadDim; ++i) d += (double) q[((size_t) r * kHeads + h) * kHeadDim + i] * kb.key(cache_fmt, g, key, i);
                         d *= a.scale;
                         const int64_t dist = p - key;
                         if (dist < kExtent)
@@ -249,13 +348,13 @@ void test_attention_prompt() {
                     for (double& s : sc) den += (s = std::exp(s - m));
                     for (int i = 0; i < kHeadDim; ++i) {
                         double acc = 0;
-                        for (int64_t key = lo; key <= p; ++key) acc += sc[(size_t) (key - lo)] * kb.val(g, key, i);
+                        for (int64_t key = lo; key <= p; ++key) acc += sc[(size_t) (key - lo)] * kb.val(cache_fmt, g, key, i);
                         ref.push_back(acc / den);
                         gsub.push_back(got[((size_t) r * kHeads + h) * kHeadDim + i]);
                     }
                 }
             char name[96];
-            std::snprintf(name, sizeof name, "attention_prompt %s %s vs CPU", window ? "window" : "full", kv_name(kv));
+            std::snprintf(name, sizeof name, "attention_prompt %s %s vs CPU", window ? "window" : "full", fmt_name(cache_fmt));
             report(name, gsub, ref, 4e-3);
             {   // the output's hash: a change meant to keep the bits keeps it
                 uint64_t h = 1469598103934665603ull;
@@ -266,8 +365,8 @@ void test_attention_prompt() {
             // the decode kernel on the same rows, over one cache that holds every position
             {
                 const int64_t cap = window ? kExtent + R + 8 : full_cap;
-                std::vector<uint8_t> dk = kb.cache(true, cap, window ? std::max<int64_t>(0, pos0 - kExtent) : 0, pos0 + R);
-                std::vector<uint8_t> dv = kb.cache(false, cap, window ? std::max<int64_t>(0, pos0 - kExtent) : 0, pos0 + R);
+                std::vector<uint8_t> dk = kb.cache(cache_fmt, true, cap, window ? std::max<int64_t>(0, pos0 - kExtent) : 0, pos0 + R);
+                std::vector<uint8_t> dv = kb.cache(cache_fmt, false, cap, window ? std::max<int64_t>(0, pos0 - kExtent) : 0, pos0 + R);
                 uint8_t *ddk = dev(dk), *ddv = dev(dv);
                 std::vector<int32_t> pos(R);
                 for (int r = 0; r < R; ++r) pos[r] = (int32_t) (pos0 + r);
@@ -281,8 +380,7 @@ void test_attention_prompt() {
                 d.k_cache = ddk;
                 d.v_cache = ddv;
                 d.cap = cap;
-                d.fp8 = a.fp8;
-                d.int8 = a.int8;
+                d.format = cache_fmt;
                 d.window = a.window;
                 const int64_t max_keys = window ? kExtent : pos0 + R;
                 void* scr = zeros<uint8_t>(attention_decode_scratch(8, max_keys));
@@ -336,15 +434,18 @@ void test_attention_prompt() {
             cudaFree(out);
         }
     // timing: a 2,048-row chunk of a window layer, and of a full layer after 8K, 32K and 128K positions, in each format
-    for (const Kv kv : {kF16, kE4M3, kI8})
+    for (const KVFormat fmt : {KVFormat::Fp16, KVFormat::Fp8, KVFormat::Int8, KVFormat::Mxfp8})
         for (const int64_t ctx : {(int64_t) 0, (int64_t) 8192, (int64_t) 32768, (int64_t) 131072}) {
             const int R = 2048;
             const bool window = ctx == 0;
+            const KVFormat ring_fmt = fmt == KVFormat::Fp16 ? KVFormat::Fp16
+                                      : fmt == KVFormat::Int8 ? KVFormat::Int8 : KVFormat::Fp8;
+            const KVFormat cache_fmt = window ? ring_fmt : fmt;
             const int64_t pos0 = window ? 8192 : ctx, cap = window ? kExtent + 8 : ctx + R;
-            uint8_t* kc = zeros<uint8_t>((size_t) kKvHeads * cap * kv_bytes(kv));
-            uint8_t* vc = zeros<uint8_t>((size_t) kKvHeads * cap * kv_bytes(kv));
-            uint8_t* st = zeros<uint8_t>((size_t) kKvHeads * R * kv_bytes(kv));
-            uint8_t* sv = zeros<uint8_t>((size_t) kKvHeads * R * kv_bytes(kv));
+            uint8_t* kc = zeros<uint8_t>((size_t) cap * cell_bytes(cache_fmt));
+            uint8_t* vc = zeros<uint8_t>((size_t) cap * cell_bytes(cache_fmt));
+            uint8_t* st = zeros<uint8_t>((size_t) R * cell_bytes(cache_fmt));
+            uint8_t* sv = zeros<uint8_t>((size_t) R * cell_bytes(cache_fmt));
             const std::vector<float> q = randn((size_t) R * kHeads * kHeadDim, 0.8f), rs = randn((size_t) R * kHeads * kRel, 1.0f);
             float *dq = dev(q), *drs = dev(rs), *dsink = zeros<float>((size_t) R * kHeads), *dt = dev(randn((size_t) kRel * kExtent, 0.3f));
             float* out = zeros<float>((size_t) R * kHeads * kHeadDim);
@@ -360,15 +461,14 @@ void test_attention_prompt() {
             a.k_chunk = window ? st : kc;
             a.v_chunk = window ? sv : vc;
             a.chunk_cap = window ? R : cap;
-            a.fp8 = kv == kE4M3;
-            a.int8 = kv == kI8;
+            a.format = cache_fmt;
             a.window = window ? kExtent : 0;
             const double us = time_us([&] { attention_prompt(a, R, out, S); }, 10);
             double pairs = 0;   // (query, key) pairs
             for (int r = 0; r < R; ++r) pairs += window ? kExtent : (double) (pos0 + r + 1);
             const double flop = pairs * kHeads * kHeadDim * 4;
             const char* where = window ? "window" : ctx == 8192 ? "full at 8K" : ctx == 32768 ? "full at 32K" : "full at 128K";
-            std::printf("  attention_prompt %s %s, 2048 rows: %.0f us (%.1f TFLOP/s of QK and PV)\n", where, kv_name(kv), us,
+            std::printf("  attention_prompt %s %s, 2048 rows: %.0f us (%.1f TFLOP/s of QK and PV)\n", where, fmt_name(cache_fmt), us,
                         flop / us / 1e6);
             cudaFree(kc);
             cudaFree(vc);
@@ -385,28 +485,30 @@ void test_attention_prompt() {
 // A chunk's staged rows into the window ring (stage_to_ring): the last `keep` positions of the chunk, cell for cell, in each
 // format, past the ring's wrap; the ring's other cells untouched.
 void test_stage_to_ring() {
-    for (const Kv kv : {kF16, kE4M3, kI8}) {
+    for (const KVFormat fmt : {KVFormat::Fp16, KVFormat::Fp8, KVFormat::Int8, KVFormat::Mxfp8}) {
+        const KVFormat ring_fmt = fmt == KVFormat::Fp16 ? KVFormat::Fp16
+                                  : fmt == KVFormat::Int8 ? KVFormat::Int8 : KVFormat::Fp8;
         const int R = 3000, keep = kExtent;
         const int64_t pos0 = 5000, stage_cap = 4096, ring_cap = kExtent + 8;
         KeyBank kb;
-        kb.make(kv, pos0 + R);
-        const std::vector<uint8_t> ks = kb.cache(true, stage_cap, pos0, pos0 + R), vs = kb.cache(false, stage_cap, pos0, pos0 + R);
-        std::vector<uint8_t> kr = kb.cache(true, ring_cap, pos0 - ring_cap, pos0), vr = kb.cache(false, ring_cap, pos0 - ring_cap, pos0);
+        kb.make(pos0 + R);
+        const std::vector<uint8_t> ks = kb.cache(ring_fmt, true, stage_cap, pos0, pos0 + R), vs = kb.cache(ring_fmt, false, stage_cap, pos0, pos0 + R);
+        std::vector<uint8_t> kr = kb.cache(ring_fmt, true, ring_cap, pos0 - ring_cap, pos0), vr = kb.cache(ring_fmt, false, ring_cap, pos0 - ring_cap, pos0);
         uint8_t *dks = dev(ks), *dvs = dev(vs), *dkr = dev(kr), *dvr = dev(vr);
-        stage_to_ring(dks, dvs, stage_cap, dkr, dvr, ring_cap, pos0, R, keep, (int) kv_bytes(kv), S);
+        stage_to_ring(dks, dvs, stage_cap, dkr, dvr, ring_cap, pos0, R, keep, head_code_bytes(ring_fmt), S);
         const std::vector<uint8_t> gk = host(dkr, kr.size()), gv = host(dvr, vr.size());
         // the ring before, its cells of the chunk's last `keep` positions replaced
         std::vector<uint8_t> wk = kr, wv = vr;
-        const std::vector<uint8_t> nk = kb.cache(true, ring_cap, pos0 + R - keep, pos0 + R), nv = kb.cache(false, ring_cap, pos0 + R - keep, pos0 + R);
-        const size_t cell = (size_t) kKvHeads * kv_bytes(kv);
+        const std::vector<uint8_t> nk = kb.cache(ring_fmt, true, ring_cap, pos0 + R - keep, pos0 + R), nv = kb.cache(ring_fmt, false, ring_cap, pos0 + R - keep, pos0 + R);
+        const size_t cell = cell_bytes(ring_fmt);
         for (int64_t p = pos0 + R - keep; p < pos0 + R; ++p) {
             std::memcpy(&wk[(size_t) (p % ring_cap) * cell], &nk[(size_t) (p % ring_cap) * cell], cell);
             std::memcpy(&wv[(size_t) (p % ring_cap) * cell], &nv[(size_t) (p % ring_cap) * cell], cell);
         }
         char name[64];
-        std::snprintf(name, sizeof name, "stage_to_ring %s (keys)", kv_name(kv));
+        std::snprintf(name, sizeof name, "stage_to_ring %s (keys)", fmt_name(ring_fmt));
         same_bits(name, gk.data(), wk.data(), wk.size());
-        std::snprintf(name, sizeof name, "stage_to_ring %s (values)", kv_name(kv));
+        std::snprintf(name, sizeof name, "stage_to_ring %s (values)", fmt_name(ring_fmt));
         same_bits(name, gv.data(), wv.data(), wv.size());
         cudaFree(dks);
         cudaFree(dvs);

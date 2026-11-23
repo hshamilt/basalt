@@ -81,6 +81,13 @@ bool ElasticArray::ensure(uint64_t bytes, uint64_t keep_free, std::string& err) 
     return true;
 }
 
+uint64_t ElasticArray::pending_backing(uint64_t bytes) const {
+    if (bytes <= backed_) return 0;
+    const uint64_t step = gran_ ? gran_ * 4 : 1;
+    const uint64_t want = std::min(reserved_, (bytes + step - 1) / step * step);
+    return want - backed_;
+}
+
 void ElasticArray::trim(uint64_t bytes) {
     if (plain_ || !base_ || extents_.empty() || extents_.back().off < bytes) return;
     cudaDeviceSynchronize();

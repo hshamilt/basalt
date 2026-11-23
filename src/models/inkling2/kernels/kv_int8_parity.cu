@@ -25,8 +25,8 @@ __global__ void encode_rows(const float* input, uint8_t* output, int rows) {
     ink::prep::int8_scales(v, 1.f, lane, scale);
 #pragma unroll
     for (int u = 0; u < 4; ++u)
-        ink::prep::store_kv(output + (size_t) row * ink::kKvInt8RowBytes, false, true,
-                            (size_t) lane * 4 + u, v[u], scale, lane);
+        ink::prep::store_kv<ink::KVFormat::Int8>(output + (size_t) row * ink::kKvInt8RowBytes,
+                                                 (size_t) lane * 4 + u, v[u], scale, lane);
 }
 
 static bool check_cuda(cudaError_t e, const char* what) {
@@ -39,8 +39,8 @@ static bool check_cuda(cudaError_t e, const char* what) {
 // (the fused kernel) and a full cache at each depth (prepare + split attention). us a call, and the K and V bytes one row
 // reads over that time (the cache's own bytes: every row of a window reads them, from L2 after the first).
 static bool bench_attention() {
-    struct Fmt { const char* name; bool fp8, int8; };
-    const Fmt fmts[] = {{"fp16", false, false}, {"e4m3", true, false}, {"int8", false, true}};
+    struct Fmt { const char* name; ink::KVFormat fmt; };
+    const Fmt fmts[] = {{"fp16", ink::KVFormat::Fp16}, {"e4m3", ink::KVFormat::Fp8}, {"int8", ink::KVFormat::Int8}};
     const int64_t depths[] = {0, 8192, 65536, 131072, 262144};   // 0: the sliding-window ring
     const int widths[] = {1, 3, 8};
     float *y = nullptr, *taps = nullptr, *qs = nullptr, *rs = nullptr, *kr = nullptr, *vr = nullptr, *table = nullptr;
@@ -65,7 +65,7 @@ static bool bench_attention() {
         for (const int64_t depth : depths) {
             const bool window = depth == 0;
             const int64_t cap = window ? ink::kExtent + ink::kDecodeRows : depth;
-            const size_t row_bytes = (size_t) ink::kv_cache_row_bytes(f.fp8, f.int8), cache = (size_t) cap * ink::kKvHeads * row_bytes;
+            const size_t row_bytes = (size_t) ink::head_code_bytes(f.fmt), cache = (size_t) cap * ink::kKvHeads * row_bytes;
             uint8_t *kc = nullptr, *vc = nullptr;
             if (!ok || !check_cuda(cudaMalloc(&kc, cache), "k cache") || !check_cuda(cudaMalloc(&vc, cache), "v cache")) {
                 ok = false;
@@ -81,11 +81,11 @@ static bool bench_attention() {
                 ink::AttnPrep pa;
                 pa.yq = y; pa.yk = y + ink::kProjQ; pa.yv = y + ink::kProjQ + ink::kProjKV; pa.ldq = pa.ldk = pa.ldv = ink::kProj;
                 pa.pos = pos; pa.full = !window; pa.k_conv = taps; pa.v_conv = taps; pa.q_scale = qs; pa.r_scale = rs;
-                pa.k_ring = kr; pa.v_ring = vr; pa.k_cache = kc; pa.v_cache = vc; pa.cap = cap; pa.fp8 = f.fp8; pa.int8 = f.int8;
+                pa.k_ring = kr; pa.v_ring = vr; pa.k_cache = kc; pa.v_cache = vc; pa.cap = cap; pa.format = f.fmt;
                 pa.q = q; pa.r = r; pa.sink = sink;
                 ink::AttnArgs aa;
                 aa.q = q; aa.r = r; aa.sink = sink; aa.rel_table = table; aa.pos = pos; aa.k_cache = kc; aa.v_cache = vc; aa.cap = cap;
-                aa.fp8 = f.fp8; aa.int8 = f.int8; aa.window = window ? ink::kExtent : 0; aa.gate = y + ink::kOffGate; aa.gate_ld = ink::kProj;
+                aa.format = f.fmt; aa.window = window ? ink::kExtent : 0; aa.gate = y + ink::kOffGate; aa.gate_ld = ink::kProj;
                 aa.q8 = q8;
                 const int64_t keys = window ? ink::kExtent : depth;
                 constexpr int reps = 50;

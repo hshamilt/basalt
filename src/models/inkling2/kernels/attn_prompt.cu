@@ -9,6 +9,7 @@
 // tensor cores with fp32 accumulation, and the sink joins the denominator at the end. A key at or after the chunk's first
 // position comes from the chunk's own buffer (a full layer's cache, a sliding-window layer's stage), an earlier one from
 // the cache (a window ring or the full cache).
+#include "basalt/models/inkling2/kv_row_codec.hpp"
 #include "basalt/models/inkling2/prompt_kernels.hpp"
 
 #include <cuda_fp16.h>
@@ -97,9 +98,9 @@ __device__ __forceinline__ uint32_t e4m3x2_to_h2(uint16_t u) {
 
 // One tile of keys and values into shared memory: key k0 + j at row j, zero outside [lo, hi].  fp16 tiles are requested
 // (cp.async, the caller commits and waits), E4M3 tiles converted and stored before the return.
-template <bool FP8, bool INT8>
+template <KVFormat F>
 __device__ __forceinline__ void load_tile(const AttnPromptArgs& a, KvTile& sm, int kvh, int64_t k0, int64_t lo, int64_t hi, int tid) {
-    if constexpr (!FP8 && !INT8) {
+    if constexpr (F == KVFormat::Fp16) {
         constexpr int kPieces = kKeys * kHeadDim / 8;   // 16-byte pieces of one tile
         for (int c = tid; c < 2 * kPieces; c += kThreads) {
             const bool isv = c >= kPieces;
@@ -123,23 +124,30 @@ __device__ __forceinline__ void load_tile(const AttnPromptArgs& a, KvTile& sm, i
             const bool ok = key >= lo && key <= hi;
             uint4 u = make_uint4(0u, 0u, 0u, 0u);
             __half sc = __float2half(1.f);   // INT8: the scale of the piece's 16 codes (one 64-channel group)
+            uint8_t scale_byte = 0;          // MXFP8: the group scale byte
             if (ok) {
                 const bool fresh = key >= a.pos0;
                 const int64_t cap = fresh ? a.chunk_cap : a.cap;
                 const uint8_t* base = static_cast<const uint8_t*>(fresh ? (isv ? a.v_chunk : a.k_chunk) : (isv ? a.v_cache : a.k_cache));
-                const size_t row = ((size_t) (key % cap) * kKvHeads + kvh) * (FP8 ? kHeadDim : INT8 ? kKvInt8RowBytes : 2 * kHeadDim);
+                const size_t row = (F == KVFormat::Mxfp8)
+                    ? (size_t) (key % cap) * cell_bytes(F) + (size_t) kvh * head_code_bytes(F)
+                    : ((size_t) (key % cap) * kKvHeads + kvh) * head_code_bytes(F);
                 u = *reinterpret_cast<const uint4*>(base + row + col);
-                if constexpr (INT8) sc = reinterpret_cast<const __half*>(base + row + kHeadDim)[col / 64];
+                if constexpr (F == KVFormat::Int8) sc = reinterpret_cast<const __half*>(base + row + kHeadDim)[col / 64];
+                if constexpr (F == KVFormat::Mxfp8) {
+                    const uint8_t* scales = base + (size_t) (key % cap) * cell_bytes(F) + code_bytes(F) + 4 * kvh;
+                    scale_byte = scales[col / 32];
+                }
             }
             uint32_t h[8];
-            if constexpr (FP8) {
+            if constexpr (F == KVFormat::Fp8) {
                 const uint32_t w[4] = {u.x, u.y, u.z, u.w};
 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
                     h[2 * i] = e4m3x2_to_h2((uint16_t) (w[i] & 0xFFFFu));
                     h[2 * i + 1] = e4m3x2_to_h2((uint16_t) (w[i] >> 16));
                 }
-            } else {
+            } else if constexpr (F == KVFormat::Int8) {
                 // a code times its fp16 scale rounded once (the product is exact before it), as the decode path's values
                 const uint32_t w[4] = {u.x ^ 0x80808080u, u.y ^ 0x80808080u, u.z ^ 0x80808080u, u.w ^ 0x80808080u};
                 const __half2 bias = __half2half2(__ushort_as_half(0x6480u)), s2 = __half2half2(sc);   // 1152
@@ -151,6 +159,15 @@ __device__ __forceinline__ void load_tile(const AttnPromptArgs& a, KvTile& sm, i
                         const __half2 v = __hmul2(__hsub2(*reinterpret_cast<const __half2*>(&b), bias), s2);
                         h[2 * i + j] = *reinterpret_cast<const uint32_t*>(&v);
                     }
+            } else {
+                const float scale = mxfp8_scale_factor(scale_byte);
+                float f[16];
+                mxfp8_decode16(u, scale, f);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const __half2 hv = __floats2half2_rn(f[2 * i], f[2 * i + 1]);
+                    h[i] = *reinterpret_cast<const uint32_t*>(&hv);
+                }
             }
             __half* dst = isv ? &sm.v[j][col] : &sm.k[j][col];
             *reinterpret_cast<uint4*>(dst) = make_uint4(h[0], h[1], h[2], h[3]);
@@ -159,7 +176,7 @@ __device__ __forceinline__ void load_tile(const AttnPromptArgs& a, KvTile& sm, i
     }
 }
 
-template <bool FP8, bool INT8>
+template <KVFormat F>
 __global__ void __launch_bounds__(kThreads, 1) attn_prompt_kernel(const AttnPromptArgs a, const int rows, float* __restrict__ out) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     Smem& sm = *reinterpret_cast<Smem*>(smem_raw);
@@ -215,13 +232,13 @@ __global__ void __launch_bounds__(kThreads, 1) attn_prompt_kernel(const AttnProm
         __syncthreads();   // every warp is done with the previous tile
         if (!ready) {
             cur = 0;
-            load_tile<FP8, INT8>(a, sm.t0, kvh, k0, lo, hi, tid);
+            load_tile<F>(a, sm.t0, kvh, k0, lo, hi, tid);
             asm volatile("cp.async.commit_group;\n" ::: "memory");
         }
         // a far tile followed by a far tile: the next one is requested into the other room before this one is used
-        const bool next = !FP8 && !INT8 && far(k0) && k0 + kKeys <= hi && far(k0 + kKeys);
+        const bool next = F == KVFormat::Fp16 && far(k0) && k0 + kKeys <= hi && far(k0 + kKeys);
         if (next) {
-            load_tile<FP8, INT8>(a, cur ? sm.t0 : sm.u.t1, kvh, k0 + kKeys, lo, hi, tid);
+            load_tile<F>(a, cur ? sm.t0 : sm.u.t1, kvh, k0 + kKeys, lo, hi, tid);
             asm volatile("cp.async.commit_group;\ncp.async.wait_group 1;\n" ::: "memory");
         } else {
             asm volatile("cp.async.wait_group 0;\n" ::: "memory");
@@ -374,14 +391,18 @@ void attention_prompt(const AttnPromptArgs& a, int rows, float* out, void* strea
     cudaStream_t s = (cudaStream_t) stream;
     static bool sized[kOptInDevices] = {};   // the opt-in is per device
     if (bool& z = sized[opt_in_device()]; !z) {
-        cudaFuncSetAttribute(attn_prompt_kernel<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
-        cudaFuncSetAttribute(attn_prompt_kernel<false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
-        cudaFuncSetAttribute(attn_prompt_kernel<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
+        cudaFuncSetAttribute(attn_prompt_kernel<KVFormat::Fp16>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
+        cudaFuncSetAttribute(attn_prompt_kernel<KVFormat::Fp8>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
+        cudaFuncSetAttribute(attn_prompt_kernel<KVFormat::Int8>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
+        cudaFuncSetAttribute(attn_prompt_kernel<KVFormat::Mxfp8>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
         z = true;
     }
-    if (a.int8) attn_prompt_kernel<false, true><<<grid, kThreads, sizeof(Smem), s>>>(a, rows, out);
-    else if (a.fp8) attn_prompt_kernel<true, false><<<grid, kThreads, sizeof(Smem), s>>>(a, rows, out);
-    else attn_prompt_kernel<false, false><<<grid, kThreads, sizeof(Smem), s>>>(a, rows, out);
+    switch (a.format) {
+    case KVFormat::Fp16:  attn_prompt_kernel<KVFormat::Fp16><<<grid, kThreads, sizeof(Smem), s>>>(a, rows, out); break;
+    case KVFormat::Fp8:   attn_prompt_kernel<KVFormat::Fp8><<<grid, kThreads, sizeof(Smem), s>>>(a, rows, out); break;
+    case KVFormat::Int8:  attn_prompt_kernel<KVFormat::Int8><<<grid, kThreads, sizeof(Smem), s>>>(a, rows, out); break;
+    case KVFormat::Mxfp8: attn_prompt_kernel<KVFormat::Mxfp8><<<grid, kThreads, sizeof(Smem), s>>>(a, rows, out); break;
+    }
     check("attention_prompt");
 }
 

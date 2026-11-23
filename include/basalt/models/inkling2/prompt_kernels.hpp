@@ -26,8 +26,7 @@ struct AttnPromptArgs {
     const void* k_chunk = nullptr;     ///< keys from pos0 on: [chunk_cap][kKvHeads][kHeadDim], position p in cell p % chunk_cap
     const void* v_chunk = nullptr;     ///< (a full layer passes its cache again; a sliding-window layer the chunk's stage)
     int64_t chunk_cap = 0;
-    bool fp8 = false;                  ///< unit-scale E4M3 codes instead of fp16
-    bool int8 = false;                 ///< symmetric INT8 codes with two per-row FP16 scales
+    KVFormat format = KVFormat::Fp16;  ///< unit-scale E4M3, symmetric INT8, or MXFP8 codes instead of fp16
     int window = 0;                    ///< > 0: keys at distance < window only
     float scale = 0.08838834764831845f;
 };

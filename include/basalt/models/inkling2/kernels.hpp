@@ -12,6 +12,12 @@
 #include <cstddef>
 #include <cstdint>
 
+#if defined(__CUDA_ARCH__) || defined(__CUDACC__)
+#define BASALT_KV_FMT __host__ __device__
+#else
+#define BASALT_KV_FMT
+#endif
+
 namespace basalt::models::inkling2 {
 
 constexpr int kWidth = 2304;        ///< the hidden width the kernels are built for
@@ -27,6 +33,41 @@ constexpr int kConvRing = 16;       ///< positions a convolution ring keeps: a w
 constexpr int kMaxMix = 6;          ///< states one mix reads: the finished blocks and the partial
 constexpr int kDecodeRows = 8;      ///< rows of a decode window's fused kernels (the products take 8 columns at most)
 constexpr int kMaxStreams = 4;      ///< loop controllers one call runs side by side
+
+// ---- KV cache formats ────────────────────────────────────────────────────────────────────────────────────────────
+//
+// The effective KV-cache format of one visit: fp16, unit-scale E4M3, or MXFP8 (E4M3 codes with one UE8M0 scale per 32
+// values). A sliding-window visit never uses MXFP8 (its ring keeps the engine's effective ring format); a full-attention
+// visit takes the engine's selected format. A cell is one position of one matrix's cache: its codes first (one head's
+// 128-value row at +128 * head for fp8/MXFP8, +256 * head for fp16), then one byte per group of 32 values (one head's 4
+// bytes at +1024 + 4 * head). fp16 keeps no scales.
+constexpr int kMxfp8GroupSize = 32;                       ///< values per scale byte
+constexpr int kMxfp8Groups = kHeadDim / kMxfp8GroupSize;  ///< groups per head (4)
+
+enum class KVFormat : uint8_t { Fp16 = 0, Fp8 = 1, Mxfp8 = 2, Int8 = 3 };
+
+BASALT_KV_FMT constexpr int head_code_bytes(KVFormat f) {
+    switch (f) {
+        case KVFormat::Fp16: return kHeadDim * 2;
+        case KVFormat::Int8: return kKvInt8RowBytes;   ///< codes + two fp16 scales, zero-padded to 16 bytes
+        case KVFormat::Fp8:
+        case KVFormat::Mxfp8: return kHeadDim;
+    }
+    return kHeadDim * 2;
+}
+BASALT_KV_FMT constexpr int code_bytes(KVFormat f) { return kKvHeads * head_code_bytes(f); }
+BASALT_KV_FMT constexpr int scale_bytes(KVFormat f) { return f == KVFormat::Mxfp8 ? kKvHeads * kMxfp8Groups : 0; }
+BASALT_KV_FMT constexpr int cell_bytes(KVFormat f) { return code_bytes(f) + scale_bytes(f); }
+BASALT_KV_FMT constexpr int codes_offset(KVFormat f, int head) { return head * head_code_bytes(f); }
+BASALT_KV_FMT constexpr int scales_offset(KVFormat f, int head) {
+    if (f == KVFormat::Mxfp8) return code_bytes(f) + 4 * head;
+    return code_bytes(f);   ///< no scales in the other formats: the offset is unused, past the end of the cell
+}
+BASALT_KV_FMT constexpr int pos_bytes(KVFormat f) { return 2 * cell_bytes(f); }   ///< one position, K + V
+
+static_assert(cell_bytes(KVFormat::Mxfp8) == 1056 && cell_bytes(KVFormat::Fp8) == 1024 && cell_bytes(KVFormat::Fp16) == 2048 &&
+                  cell_bytes(KVFormat::Int8) == 8 * kKvInt8RowBytes,
+              "the Inkling 2 cell layout");
 
 /// A layer's fused projection rows, in this order: q, r, gate, sink (read from the query input), k and the key
 /// convolution's per-token taps (from the key input), v and its taps (from the value input). A sliding-window layer has no
@@ -93,11 +134,10 @@ struct AttnPrep {
     float log_floor = 8192.f, log_alpha = 0.1f;
     float* k_ring = nullptr;           ///< the convolution inputs of the last kConvRing positions [kConvRing][1024], slot pos % kConvRing
     float* v_ring = nullptr;
-    void* k_cache = nullptr;           ///< [cap][kKvHeads][kHeadDim], position p in cell p % cap; fp16 or E4M3 (fp8 set)
+    void* k_cache = nullptr;           ///< [cap][kKvHeads][kHeadDim], position p in cell p % cap; fp16, unit-scale E4M3 or MXFP8
     void* v_cache = nullptr;
     int64_t cap = 0;
-    bool fp8 = false;                  ///< unit-scale E4M3 codes (keys are clipped and values normed, so they fit)
-    bool int8 = false;                 ///< symmetric INT8 codes with two per-row FP16 scales
+    KVFormat format = KVFormat::Fp16;  ///< the cache's format (unit-scale E4M3, symmetric INT8, or MXFP8 for the quantized caches)
     float* q = nullptr;                ///< out: the clipped (and scaled) queries [rows][kHeads][kHeadDim]
     float* r = nullptr;                ///< out: the relative states [rows][kHeads][kRel]
     float* sink = nullptr;             ///< out: [rows][kHeads]
@@ -118,8 +158,7 @@ struct AttnArgs {
     const void* k_cache = nullptr;
     const void* v_cache = nullptr;
     int64_t cap = 0;                   ///< the cache's cells (a ring when window is set)
-    bool fp8 = false;
-    bool int8 = false;
+    KVFormat format = KVFormat::Fp16;  ///< the caches' format
     int window = 0;                    ///< > 0: keys at distance < window only (the cache is then a ring of cap >= window + rows)
     float scale = 0.08838834764831845f;
     const float* gate = nullptr;       ///< set: the output is gated by sigmoid(gate[r * gate_ld + h * kHeadDim + d])

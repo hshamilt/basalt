@@ -24,6 +24,9 @@ public:
     uint64_t growth(uint64_t bytes) const;
     /// Gives back the whole allocations that lie past `bytes` (the device is synchronised first); the address range stays.
     void trim(uint64_t bytes);
+    /// The bytes `ensure()` would actually back for the first `bytes`: the same 4-granularity rounding and the same
+    /// cap by the reserved range, zero when the array is already backed that far (nonmutating — it reads no device state).
+    uint64_t pending_backing(uint64_t bytes) const;
     uint8_t* data() const { return base_; }
     uint64_t backed() const { return backed_; }
     uint64_t capacity() const { return reserved_; }

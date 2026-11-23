@@ -52,7 +52,7 @@ add_library(vision_cuda STATIC
   ${VISION_ROOT}/src/vision/encoder_cuda.cu
   ${VISION_ROOT}/src/vision/vision_kernels.cu)
 target_include_directories(vision_cuda PUBLIC ${VISION_ROOT}/include ${VISION_ROOT}/src/vision)
-target_link_libraries(vision_cuda PUBLIC vision_core CUDA::cudart CUDA::cublas)
+target_link_libraries(vision_cuda PUBLIC vision_core ${_gpu_runtime_target} CUDA::cublas)
 
 add_executable(basalt-vision vision.cpp)
 target_compile_definitions(basalt-vision PRIVATE BASALT_VISION_CUDA)

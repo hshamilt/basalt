@@ -2,6 +2,7 @@
 // (short convolutions, clips, cache writes), output gate, post-sublayer convolutions, expert plan and sum, and softcap.
 #include "basalt/kernels/doorbell.cuh"
 #include "basalt/kernels/pdl.hpp"
+#include "basalt/models/inkling2/kv_row_codec.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
 
 #include <cuda_fp16.h>
@@ -217,21 +218,21 @@ __device__ __forceinline__ float4 conv_in4(const float* __restrict__ y, int ld, 
     return *reinterpret_cast<const float4*>(ring + (size_t) (p % kConvRing) * ring_w + c);
 }
 
-__device__ __forceinline__ void store_kv4(void* cache, bool fp8, size_t idx, float v0, float v1, float v2, float v3) {
-    if (fp8) {
-        __nv_fp8_e4m3 q0(v0), q1(v1), q2(v2), q3(v3);
-        const uint32_t packed = (uint32_t) *reinterpret_cast<uint8_t*>(&q0) |
-                                ((uint32_t) *reinterpret_cast<uint8_t*>(&q1) << 8) |
-                                ((uint32_t) *reinterpret_cast<uint8_t*>(&q2) << 16) |
-                                ((uint32_t) *reinterpret_cast<uint8_t*>(&q3) << 24);
-        *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(cache) + idx) = packed;
-    } else {
-        const __half2 h0 = __floats2half2_rn(v0, v1), h1 = __floats2half2_rn(v2, v3);
-        uint2 u;
-        u.x = *reinterpret_cast<const uint32_t*>(&h0);
-        u.y = *reinterpret_cast<const uint32_t*>(&h1);
-        *reinterpret_cast<uint2*>(static_cast<__half*>(cache) + idx) = u;
-    }
+__device__ __forceinline__ void store_kv4(uint8_t* cache, size_t idx, float v0, float v1, float v2, float v3) {
+    const __half2 h0 = __floats2half2_rn(v0, v1), h1 = __floats2half2_rn(v2, v3);
+    uint2 u;
+    u.x = *reinterpret_cast<const uint32_t*>(&h0);
+    u.y = *reinterpret_cast<const uint32_t*>(&h1);
+    *reinterpret_cast<uint2*>(cache + idx) = u;
+}
+
+__device__ __forceinline__ void store_kv4_fp8(uint8_t* cache, size_t idx, float v0, float v1, float v2, float v3) {
+    __nv_fp8_e4m3 q0(v0), q1(v1), q2(v2), q3(v3);
+    const uint32_t packed = (uint32_t) *reinterpret_cast<uint8_t*>(&q0) |
+                            ((uint32_t) *reinterpret_cast<uint8_t*>(&q1) << 8) |
+                            ((uint32_t) *reinterpret_cast<uint8_t*>(&q2) << 16) |
+                            ((uint32_t) *reinterpret_cast<uint8_t*>(&q3) << 24);
+    *reinterpret_cast<uint32_t*>(cache + idx) = packed;
 }
 
 __device__ __forceinline__ void store_kv(void* row, bool fp8, bool int8, size_t idx, float v, const float (&scale)[2], int lane) {
@@ -254,6 +255,7 @@ __device__ __forceinline__ void store_kv(void* row, bool fp8, bool int8, size_t 
 
 // A block per row: warp w holds kv head w's 128 key and value channels (4 a lane), then three query heads and their
 // relative states.
+template <KVFormat F>
 __global__ void __launch_bounds__(kThreads) attn_prepare_kernel(AttnPrep a) {
     const int r = blockIdx.x, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const float* yq = a.yq + (size_t) r * a.ldq;
@@ -299,17 +301,22 @@ __global__ void __launch_bounds__(kThreads) attn_prepare_kernel(AttnPrep a) {
         const float f = which == 0 ? fminf(a.qk_clip / (sqrtf(ss) + 1e-6f), 1.f) : rsqrtf(ss / (float) kHeadDim + a.eps);
         float scale[2] = {};
         const int64_t cell = p % a.cap;
-        const size_t row_bytes = a.fp8 ? kHeadDim : a.int8 ? kKvInt8RowBytes : 2 * kHeadDim;
-        void* cache = which ? a.v_cache : a.k_cache;
-        if (a.int8) {
+        const size_t cell_base = (size_t) cell * cell_bytes(F) + (size_t) w * head_code_bytes(F);
+        uint8_t* cache = (uint8_t*)(which ? a.v_cache : a.k_cache);
+        if constexpr (F == KVFormat::Int8) {
             float val[4] = {val0, val1, val2, val3};
             int8_scales(val, f, lane, scale);
-            void* row = static_cast<uint8_t*>(cache) + ((size_t) cell * kKvHeads + w) * row_bytes;
 #pragma unroll
-            for (int u = 0; u < 4; ++u) store_kv(row, false, true, lane * 4 + u, val[u] * f, scale, lane);
+            for (int u = 0; u < 4; ++u) store_kv(cache + cell_base, false, true, lane * 4 + u, val[u] * f, scale, lane);
+        } else if constexpr (F == KVFormat::Fp16) {
+            store_kv4(cache, cell_base + lane * 8, val0 * f, val1 * f, val2 * f, val3 * f);
+        } else if constexpr (F == KVFormat::Fp8) {
+            store_kv4_fp8(cache, cell_base + lane * 4, val0 * f, val1 * f, val2 * f, val3 * f);
         } else {
-            store_kv4(cache, a.fp8, ((size_t) cell * kKvHeads + w) * kHeadDim + lane * 4,
-                      val0 * f, val1 * f, val2 * f, val3 * f);
+            float vals[4] = {val0 * f, val1 * f, val2 * f, val3 * f};
+            uint8_t* codes = cache + cell_base;
+            uint8_t* scales = cache + (size_t) cell * cell_bytes(F) + scales_offset(F, w);
+            mxfp8_encode_row(vals, codes, scales, lane);
         }
     }
     // queries: warp w takes heads 3w .. 3w + 2
@@ -678,7 +685,12 @@ void ctrl_blend(const float* dest, const float* msg, const float* gf, int rows, 
 void attn_prepare(const AttnPrep& a, int rows, void* stream) {
     if (rows <= 0) return;
     cudaStream_t s = (cudaStream_t) stream;
-    attn_prepare_kernel<<<rows, kThreads, 0, s>>>(a);
+    switch (a.format) {
+    case KVFormat::Fp16:  attn_prepare_kernel<KVFormat::Fp16><<<rows, kThreads, 0, s>>>(a); break;
+    case KVFormat::Fp8:   attn_prepare_kernel<KVFormat::Fp8><<<rows, kThreads, 0, s>>>(a); break;
+    case KVFormat::Int8:  attn_prepare_kernel<KVFormat::Int8><<<rows, kThreads, 0, s>>>(a); break;
+    case KVFormat::Mxfp8: attn_prepare_kernel<KVFormat::Mxfp8><<<rows, kThreads, 0, s>>>(a); break;
+    }
     check("attn_prepare");
     ring_store(a.yk, (int) a.ldk, 0, kKvHeads * kHeadDim, a.pos, rows, a.k_ring, s);
     ring_store(a.yv, (int) a.ldv, 0, kKvHeads * kHeadDim, a.pos, rows, a.v_ring, s);

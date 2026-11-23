@@ -79,10 +79,16 @@ class Service:
     def model_entry(self) -> dict:
         """This model's row in /v1/models."""
         value = "loading" if self.loading else "loaded" if self.loaded() else "unloaded"
+        meta = {"n_ctx": self.engine.max_context}
+        if self.loaded():
+            # the loaded engine's own fact, never the flags or a stale info
+            kv = (getattr(self.engine, "info", {}) or {}).get("kv")
+            if kv:
+                meta["kv"] = kv
         return {"id": self.model, "object": "model", "created": int(self.started_at), "owned_by": "basalt",
                 "status": {"value": value},
                 "asleep": getattr(self.engine, "asleep", False) is True,
-                "meta": {"n_ctx": self.engine.max_context},
+                "meta": meta,
                 "architecture": {"input_modalities": ["text", "image"] + (["video"] if self.video_on() else [])
                                  if self.vision is not None else ["text"],
                                  "output_modalities": ["text"]}}
@@ -986,7 +992,9 @@ class Service:
             "cache_max_tokens": ctx,
             # the cells of K/V all sessions together can hold before a request is refused (None: no elastic KV)
             "context": {"native": ctx, "max_positions": ctx,
-                        "elastic_kv_ceiling": (getattr(self.engine, "info", {}) or {}).get("elastic_kv_ceiling")},
+                        "elastic_kv_ceiling": (getattr(self.engine, "info", {}) or {}).get("elastic_kv_ceiling"),
+                        # the loaded engine's effective format; omitted when the engine is not loaded
+                        "kv": (getattr(self.engine, "info", {}) or {}).get("kv") if self.loaded() else None},
             "concurrency": {"serving": max(1, int(getattr(self.engine, "batch", 0) or 0)),
                             "requested": max(1, int(getattr(self.engine, "batch", 0) or 0))},
             "dialects": ["/v1/chat/completions", "/v1/messages", "/v1/responses"],

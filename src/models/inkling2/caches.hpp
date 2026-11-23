@@ -5,13 +5,16 @@
 
 #include <cstdint>
 
+#include "basalt/models/inkling2/kernels.hpp"
+
 namespace basalt::models::inkling2 {
 
 struct VisitCache {
-    void* k = nullptr;                   ///< [cap][kKvHeads][kHeadDim], position p in cell p % cap; fp16 or unit-scale E4M3
+    void* k = nullptr;                   ///< [cap][kKvHeads][kHeadDim], position p in cell p % cap; fp16, unit-scale E4M3 or MXFP8
     void* v = nullptr;
     int64_t cap = 0;
     bool ring = false;                   ///< a sliding-window visit: cells are positions modulo cap
+    KVFormat format = KVFormat::Fp16;    ///< the caches' effective format (fp16/fp8 for a ring, the engine's format for a full visit)
     float* k_ring = nullptr;             ///< the key convolution's inputs of the last kConvRing positions [kConvRing][1024]
     float* v_ring = nullptr;
     float* a_ring = nullptr;             ///< the attention output's, before its convolution [kConvRing][n_embd]

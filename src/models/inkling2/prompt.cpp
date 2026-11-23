@@ -471,8 +471,7 @@ private:
                      q8::Epilogue::Store, strm());
         }
         // convolutions, clips and the keys: a sliding-window visit stages the chunk's own, a full visit writes its cells
-        const bool fp8 = m_.cache_fp8();
-        const bool int8 = m_.cache_int8();
+        const KVFormat fmt = c.format;
         AttnPrep ap;
         ap.yq = b().yq;
         ap.yk = one ? b().yq + kProjQ : b().yk;
@@ -494,8 +493,7 @@ private:
         ap.k_cache = c.ring ? b().k_stage : c.k;
         ap.v_cache = c.ring ? b().v_stage : c.v;
         ap.cap = c.ring ? kChunk : c.cap;
-        ap.fp8 = fp8;
-        ap.int8 = int8;
+        ap.format = fmt;
         ap.q = b().q;
         ap.r = b().r;
         ap.sink = b().sink;
@@ -512,13 +510,12 @@ private:
         aa.k_chunk = ap.k_cache;
         aa.v_chunk = ap.v_cache;
         aa.chunk_cap = ap.cap;
-        aa.fp8 = fp8;
-        aa.int8 = int8;
+        aa.format = fmt;
         aa.window = c.ring ? g_.window : 0;
         aa.scale = 1.0f / std::sqrt((float) kHeadDim);
         attention_prompt(aa, rows, b().attn, strm());
         if (c.ring) stage_to_ring(b().k_stage, b().v_stage, kChunk, c.k, c.v, c.cap, pos0, rows, g_.window,
-                                  kv_cache_row_bytes(fp8, int8), strm());
+                                  head_code_bytes(c.format), strm());
         attn_gate_q8_planes_prompt(b().attn, b().yq, one ? kProj : kProjQ, rows, b().xqd, strm());
         q8::gemm(reinterpret_cast<const int8_t*>(w.out), w.out_sc_t, E, kOut, b().xqd, rows, b().o, E,
                  q8::Epilogue::Store, strm());

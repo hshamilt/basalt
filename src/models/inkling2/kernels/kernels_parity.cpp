@@ -119,6 +119,130 @@ double h2d(uint16_t h) {
     return (double) __half2float(__half(r));
 }
 uint16_t f2h(float f) { return __half_raw(__float2half(f)).x; }
+uint8_t f2e4(float f) {
+    const __nv_fp8_e4m3 q(f);
+    return *reinterpret_cast<const uint8_t*>(&q);
+}
+double e42d(uint8_t c) {
+    __nv_fp8_e4m3 q;
+    *reinterpret_cast<uint8_t*>(&q) = c;
+    return (double) (float) q;
+}
+// The MXFP8 oracle, scalar: the same rules the kernel writes (basalt/models/inkling2/kv_row_codec.hpp)
+static uint8_t mxfp8_exponent(float amax, bool bad) {
+    if (bad || !std::isfinite(amax) || amax < 0.f) return 255;
+    const float raw = amax * (1.0f / 448.0f);
+    if (raw <= std::ldexp(1.0f, -127)) return 0;
+    uint32_t bits;
+    std::memcpy(&bits, &raw, 4);
+    const uint32_t e = ((bits + 0x007FFFFFu) & 0x7F800000u) >> 23;
+    return (uint8_t) std::min<uint32_t>(e, 254u);
+}
+static double mxfp8_decode(uint8_t code, uint8_t e) {
+    if (e == 255) return std::numeric_limits<double>::quiet_NaN();
+    const int sign = (code & 0x80) ? 1 : 0;
+    const uint8_t mag = code & 0x7F;
+    const int exp = (mag >> 3) & 0x0F, mant = mag & 0x07;
+    double v;
+    if (exp == 0) v = mant * std::ldexp(1.0, -9);
+    else if (exp == 0x0F && mant == 7) v = std::numeric_limits<double>::quiet_NaN();
+    else v = (1.0 + mant / 8.0) * std::ldexp(1.0, exp - 7);
+    if (sign) v = -v;
+    return v * std::ldexp(1.0, int(e) - 127);
+}
+// The full-visit cache bytes: [cap] cells, head-major, codes first then the four group exponents per head
+std::vector<uint8_t> build_full_cache(KVFormat fmt, const std::vector<float>& src, int64_t cap) {
+    const size_t per_cell = kKvHeads * kHeadDim;
+    if (fmt == KVFormat::Fp16) {
+        std::vector<uint8_t> out((size_t) cap * per_cell * 2, 0);
+        for (size_t i = 0; i < src.size(); ++i) {
+            const uint16_t hv = f2h(src[i]);
+            std::memcpy(&out[i * 2], &hv, 2);
+        }
+        return out;
+    }
+    if (fmt == KVFormat::Fp8) {
+        std::vector<uint8_t> out(src.size(), 0);
+        for (size_t i = 0; i < src.size(); ++i) out[i] = f2e4(src[i]);
+        return out;
+    }
+    if (fmt == KVFormat::Int8) {
+        std::vector<uint8_t> out((size_t) cap * cell_bytes(KVFormat::Int8), 0);
+        for (int64_t p = 0; p < cap; ++p) {
+            for (int h = 0; h < kKvHeads; ++h) {
+                uint8_t* row = out.data() + (size_t) p * cell_bytes(KVFormat::Int8) + (size_t) h * head_code_bytes(KVFormat::Int8);
+                for (int grp = 0; grp < 2; ++grp) {
+                    float m = 0.f;
+                    for (int d = grp * 64; d < (grp + 1) * 64; ++d) m = std::max(m, std::fabs(src[((size_t) p * kKvHeads + h) * kHeadDim + d]));
+                    const uint16_t sh = f2h(m / 127.f);
+                    std::memcpy(row + kHeadDim + 2 * grp, &sh, 2);
+                    const float sc = (float) h2d(sh);
+                    for (int d = grp * 64; d < (grp + 1) * 64; ++d) {
+                        const float x = src[((size_t) p * kKvHeads + h) * kHeadDim + d];
+                        const int q = sc > 0.f ? std::clamp((int) std::nearbyint(x / sc), -127, 127) : 0;
+                        row[d] = (uint8_t) (int8_t) q;
+                    }
+                }
+            }
+        }
+        return out;
+    }
+    std::vector<uint8_t> out((size_t) cap * cell_bytes(KVFormat::Mxfp8), 0);
+    for (int64_t p = 0; p < cap; ++p) {
+        uint8_t* cell = out.data() + (size_t) p * cell_bytes(KVFormat::Mxfp8);
+        for (int h = 0; h < kKvHeads; ++h) {
+            uint8_t* codes = cell + codes_offset(KVFormat::Mxfp8, h);
+            uint8_t* scales = cell + scales_offset(KVFormat::Mxfp8, h);
+            for (int g = 0; g < 4; ++g) {
+                float vals[32];
+                float amax = 0.f;
+                bool bad = false;
+                for (int i = 0; i < 32; ++i) {
+                    vals[i] = src[((size_t) p * kKvHeads + h) * kHeadDim + g * 32 + i];
+                    if (!std::isfinite(vals[i])) bad = true;
+                    amax = std::max(amax, std::fabs(vals[i]));
+                }
+                const uint8_t e = mxfp8_exponent(amax, bad);
+                scales[g] = e;
+                const float inv = (e == 255 || e == 0) ? 0.f : std::ldexp(1.0f, 127 - (int) e);
+                for (int i = 0; i < 32; ++i) {
+                    uint8_t code = 0;
+                    if (e != 255 && !bad) {
+                        const float v = std::min(std::max(vals[i] * inv, -448.0f), 448.0f);
+                        code = f2e4(v);
+                    }
+                    codes[g * 32 + i] = code;
+                }
+            }
+        }
+    }
+    return out;
+}
+// the decoded value at flat index i in a built cell (i = ((p * kKvHeads + h) * kHeadDim + d))
+static double decode_cell_value(const uint8_t* bytes, KVFormat fmt, size_t i) {
+    if (fmt == KVFormat::Fp16) {
+        uint16_t hv;
+        std::memcpy(&hv, &bytes[i * 2], 2);
+        return h2d(hv);
+    }
+    if (fmt == KVFormat::Fp8) return e42d(bytes[i]);
+    if (fmt == KVFormat::Int8) {
+        const int64_t p = (int64_t) (i / (kKvHeads * kHeadDim));
+        const int h = (int) ((i / kHeadDim) % kKvHeads);
+        const int d = (int) (i % kHeadDim);
+        const uint8_t* row = bytes + (size_t) p * cell_bytes(KVFormat::Int8) + (size_t) h * head_code_bytes(KVFormat::Int8);
+        uint16_t sh;
+        std::memcpy(&sh, row + kHeadDim + 2 * (d / 64), 2);
+        return (double) (int8_t) row[d] * h2d(sh);
+    }
+    const int64_t p = (int64_t) (i / (kKvHeads * kHeadDim));
+    const int h = (int) ((i / kHeadDim) % kKvHeads);
+    const int d = (int) (i % kHeadDim);
+    const uint8_t* cell = bytes + (size_t) p * cell_bytes(KVFormat::Mxfp8);
+    const uint8_t code = cell[codes_offset(KVFormat::Mxfp8, h) + d];
+    const uint8_t e = cell[scales_offset(KVFormat::Mxfp8, h) + d / 32];
+    return mxfp8_decode(code, e);
+}
 double tanhd(double x) { return std::tanh(x); }
 double sig(double x) { return 1.0 / (1.0 + std::exp(-x)); }
 
@@ -127,8 +251,8 @@ enum Kv { kF16, kE4M3, kI8 };
 const Kv kAllKv[] = {kF16, kE4M3, kI8};
 size_t kv_bytes(Kv kv) { return (size_t) kv_cache_row_bytes(kv == kE4M3, kv == kI8); }
 const char* kv_tag(Kv kv) { return kv == kE4M3 ? ", E4M3" : kv == kI8 ? ", INT8" : ""; }
-void kv_set(Kv kv, AttnPrep& a) { a.fp8 = kv == kE4M3; a.int8 = kv == kI8; }
-void kv_set(Kv kv, AttnArgs& a) { a.fp8 = kv == kE4M3; a.int8 = kv == kI8; }
+void kv_set(Kv kv, AttnPrep& a) { a.format = kv == kE4M3 ? KVFormat::Fp8 : kv == kI8 ? KVFormat::Int8 : KVFormat::Fp16; }
+void kv_set(Kv kv, AttnArgs& a) { a.format = kv == kE4M3 ? KVFormat::Fp8 : kv == kI8 ? KVFormat::Int8 : KVFormat::Fp16; }
 // One head row of kHeadDim values `x` written in format kv to `row` (kv_bytes(kv) bytes); `got` takes the values the row
 // holds. INT8: each 64 channels' scale the fp16 rounding of their max |x| / 127, codes x / scale rounded to nearest even.
 void put_row(Kv kv, const float* x, uint8_t* row, double* got) {
@@ -468,29 +592,32 @@ void test_prepare() {
 // ---- attention ---------------------------------------------------------------------------------------------------------
 
 void test_attention() {
-    // a window ring, a full cache, a full cache of E4M3 codes, a full cache and a window ring of INT8 codes
-    for (int mode = 0; mode < 5; ++mode) {
-        const bool window = mode == 0 || mode == 4;
-        const Kv kv = mode == 2 ? kE4M3 : mode >= 3 ? kI8 : kF16;
+    // a window ring, a full cache, a full cache of E4M3 codes, a full cache and a window ring of INT8 codes, a full cache of MXFP8
+    struct Mode { bool window; KVFormat fmt; const char* label; };
+    const Mode modes[] = {
+        {true, KVFormat::Fp16, "window, fp16"},
+        {false, KVFormat::Fp16, "full, fp16"},
+        {false, KVFormat::Fp8, "full, E4M3"},
+        {false, KVFormat::Int8, "full, INT8"},
+        {false, KVFormat::Mxfp8, "full, MXFP8"},
+    };
+    for (const Mode& m : modes) {
+        const bool window = m.window;
+        const KVFormat fmt = m.fmt;
         const int R = 4;
         const int p0 = window ? 2900 : 2995;
         const int64_t cap = window ? kExtent + 8 : 3000;
         std::vector<int> pos(R);
         for (int r = 0; r < R; ++r) pos[r] = p0 + r;
-        std::vector<double> kd, vd;   // the cached values as the kernel reads them, [cell][kKvHeads][kHeadDim]
+        // deterministic values (the kHash tables above pin this test)
+        std::vector<double> kd((size_t) kKvHeads * cap * kHeadDim), vd(kd.size());   // the cached values as the kernel reads them
         std::vector<uint8_t> kb, vb;
-        {
-            const size_t rows = (size_t) kKvHeads * cap;
-            kb.assign(rows * kv_bytes(kv), 0);
-            vb.assign(rows * kv_bytes(kv), 0);
-            kd.resize(rows * kHeadDim);
-            vd.resize(rows * kHeadDim);
-            const std::vector<float> ksrc = fixed_values(rows * kHeadDim, 0.6f, 0x21a48d3bu);
-            const std::vector<float> vsrc = fixed_values(rows * kHeadDim, 1.0f, 0x7b51c2e9u);
-            for (size_t i = 0; i < rows; ++i) {
-                put_row(kv, &ksrc[i * kHeadDim], &kb[i * kv_bytes(kv)], &kd[i * kHeadDim]);
-                put_row(kv, &vsrc[i * kHeadDim], &vb[i * kv_bytes(kv)], &vd[i * kHeadDim]);
-            }
+        const std::vector<float> ksrc = fixed_values(kd.size(), 0.6f, 0x21a48d3bu);
+        const std::vector<float> vsrc = fixed_values(vd.size(), 1.0f, 0x7b51c2e9u);
+        kb = build_full_cache(fmt, ksrc, cap); vb = build_full_cache(fmt, vsrc, cap);
+        for (size_t i = 0; i < kd.size(); ++i) {
+            kd[i] = decode_cell_value(kb.data(), fmt, i);
+            vd[i] = decode_cell_value(vb.data(), fmt, i);
         }
         const std::vector<float> q = fixed_values((size_t) R * kHeads * kHeadDim, 0.8f, 0x44b13a97u);
         const std::vector<float> rs = fixed_values((size_t) R * kHeads * kRel, 1.0f, 0x2f9d08c5u);
@@ -503,8 +630,7 @@ void test_attention() {
         float* dgate = dev(gate);
         int* dpos = dev(pos);
         AttnArgs a;
-        a.q = dq; a.r = drs; a.sink = dsink; a.rel_table = dt; a.pos = dpos; a.k_cache = dk; a.v_cache = dv; a.cap = cap;
-        kv_set(kv, a);
+        a.q = dq; a.r = drs; a.sink = dsink; a.rel_table = dt; a.pos = dpos; a.k_cache = dk; a.v_cache = dv; a.cap = cap; a.format = fmt;
         a.window = window ? kExtent : 0;
         const int64_t max_keys = window ? kExtent : p0 + R;
         void* scr = zeros<uint8_t>(attention_decode_scratch(R, 1 << 20));
@@ -535,14 +661,17 @@ void test_attention() {
                     ref[((size_t) r * kHeads + h) * kHeadDim + i] = acc / den;
                 }
             }
-        char tag[64];
-        std::snprintf(tag, sizeof tag, "attention (%s%s)", window ? "window ring" : "full, 3k keys", kv_tag(kv));
-        report(tag, got, ref, 2e-3);
+        const char* tag = window ? "window ring" : "full, 3k keys";
+        const char* kv_tag_str = fmt == KVFormat::Fp8 ? ", E4M3" : fmt == KVFormat::Int8 ? ", INT8" : fmt == KVFormat::Mxfp8 ? ", MXFP8" : "";
+        char stat[128];
+        std::snprintf(stat, sizeof stat, "attention (%s%s)", tag, kv_tag_str);
+        report(stat, got, ref, 2e-3);
         const uint64_t hash = print_hash("output", bytes_of(got));
         // Frozen outputs from main's FP16/FP8 kernels on the fixed attention fixture.
         static constexpr uint64_t kBaseHashes[] = {0x37a69c7be6281e30ull, 0xde59e213bef8dbb9ull, 0x8302535765d7601full};
-        if (mode < 3) {
-            const bool baseline = hash == kBaseHashes[mode];
+        const int base_mode = window && fmt == KVFormat::Fp16 ? 0 : !window && fmt == KVFormat::Fp16 ? 1 : !window && fmt == KVFormat::Fp8 ? 2 : -1;
+        if (base_mode >= 0) {
+            const bool baseline = hash == kBaseHashes[base_mode];
             std::printf("  previous FP16/FP8 baseline %s\n", baseline ? "matches" : "FAIL");
             failures += !baseline;
         }
@@ -576,8 +705,8 @@ void test_attention() {
         const double us = time_us([&] { attention_decode(one, 1, max_keys, scr, out1, nullptr); });
         const double keys = window ? kExtent : p0 + 3;
         std::printf("  %.1f us a call (1 row, %.0f keys: %.0f GB/s of K and V)\n", us, keys,
-                    keys * kKvHeads * kv_bytes(kv) * 2 / us / 1e3);
-        if (mode == 1) {   // a short context: the latency a decode token sees early on
+                    keys * cell_bytes(fmt) * 2 / us / 1e3);
+        if (!window && fmt == KVFormat::Fp16) {   // a short context: the latency a decode token sees early on
             std::vector<int> p1 = {40};
             int* dp1 = dev(p1);
             AttnArgs s1 = one;
@@ -967,15 +1096,22 @@ void test_attention_window() {
     const Case cases[] = {{true, 0, 1, kExtent + 8}, {true, 300, 3, kExtent + 8}, {true, 2900, 8, kExtent + 8},
                           {false, 700, 8, 4096}, {false, 120, 2, 4096}, {false, 2000, 2, 4096},
                           {true, 0, 2, kExtent + 8}, {true, 127, 2, kExtent + 8}, {false, 1, 2, 4096}};   // 2 rows: one slice, a slice each, the ring before position 0
-    for (const Kv kv : kAllKv)
+    for (const KVFormat fmt : {KVFormat::Fp16, KVFormat::Fp8, KVFormat::Int8, KVFormat::Mxfp8})
         for (const Case& k : cases) {
+            // window visits keep the engine's effective ring format (fp16 or unit-scale E4M3); full visits take the mode's
+            const KVFormat ring_fmt = fmt == KVFormat::Fp16 ? KVFormat::Fp16
+                                      : fmt == KVFormat::Int8 ? KVFormat::Int8 : KVFormat::Fp8;
+            const KVFormat cache_fmt = k.window ? ring_fmt : fmt;
             const int R = k.R;
             std::vector<int> pos(R);
             for (int r = 0; r < R; ++r) pos[r] = k.p0 + r;
-            std::vector<uint8_t> kc = kv_rows(kv, (size_t) kKvHeads * k.cap, 0.6f), vc = kv_rows(kv, (size_t) kKvHeads * k.cap, 1.0f);
-            if (kv == kI8)   // the padding poisoned: the rows the window writes must come out zero-padded
+            const size_t n_kv = (size_t) kKvHeads * k.cap * kHeadDim;
+            std::vector<float> ksrc(n_kv), vsrc(n_kv);
+            for (size_t i = 0; i < n_kv; ++i) { ksrc[i] = randn(1, 0.6f)[0]; vsrc[i] = randn(1, 1.0f)[0]; }
+            std::vector<uint8_t> kc = build_full_cache(cache_fmt, ksrc, k.cap), vc = build_full_cache(cache_fmt, vsrc, k.cap);
+            if (cache_fmt == KVFormat::Int8)   // the padding poisoned: the rows the window writes must come out zero-padded
                 for (size_t i = 0; i < kc.size(); ++i)
-                    if (i % kv_bytes(kv) >= kHeadDim + 4) kc[i] = vc[i] = 0xa5;
+                    if (i % head_code_bytes(KVFormat::Int8) >= kHeadDim + 4) kc[i] = vc[i] = 0xa5;
             const std::vector<float> y = randn((size_t) R * kProj, 1.5f);
             const std::vector<float> tk = randn(1024 * kConv, 0.3f), tv = randn(1024 * kConv, 0.3f);
             const std::vector<float> qs = randn(kHeads * kHeadDim, 0.2f, 1.f), rsc = randn(kHeads * kRel, 0.2f, 1.f);
@@ -989,15 +1125,12 @@ void test_attention_window() {
                 AttnPrep& p = pa[i];
                 p.yq = dy; p.yk = dy + kProjQ; p.yv = dy + kProjQ + kProjKV; p.ldq = p.ldk = p.ldv = kProj;
                 p.pos = dpos; p.full = !k.window; p.k_conv = dev(tk); p.v_conv = dev(tv); p.q_scale = dev(qs); p.r_scale = dev(rsc);
-                p.k_ring = dev(kr); p.v_ring = dev(vr); p.k_cache = dev(kc); p.v_cache = dev(vc); p.cap = k.cap;
-                kv_set(kv, p);
+                p.k_ring = dev(kr); p.v_ring = dev(vr); p.k_cache = dev(kc); p.v_cache = dev(vc); p.cap = k.cap; p.format = cache_fmt;
                 p.q = zeros<float>((size_t) R * kHeads * kHeadDim); p.r = zeros<float>((size_t) R * kHeads * kRel);
                 p.sink = zeros<float>((size_t) R * kHeads);
                 AttnArgs& a = aa[i];
                 a.q = p.q; a.r = p.r; a.sink = p.sink; a.rel_table = dev(table); a.pos = dpos; a.k_cache = p.k_cache; a.v_cache = p.v_cache;
-                a.cap = k.cap;
-                kv_set(kv, a);
-                a.window = k.window ? kExtent : 0; a.gate = dy + kOffGate; a.gate_ld = kProj;
+                a.cap = k.cap; a.format = cache_fmt; a.window = k.window ? kExtent : 0; a.gate = dy + kOffGate; a.gate_ld = kProj;
                 a.q8 = zeros<uint8_t>((size_t) R * kHeads * kHeadDim / 32 * 36);
             }
             int64_t max_keys = 1024;
@@ -1014,17 +1147,19 @@ void test_attention_window() {
                               host((uint8_t*) pa[0].v_cache, kvb) == host((uint8_t*) pa[1].v_cache, kvb) &&
                               host(pa[0].k_ring, ringb) == host(pa[1].k_ring, ringb) && host(pa[0].v_ring, ringb) == host(pa[1].v_ring, ringb);
             char tag[96];
-            std::snprintf(tag, sizeof tag, "attention_window (%s%s, %d rows at %d)", k.window ? "window" : "full", kv_tag(kv), R, k.p0);
+            static const char* kKvNames[4] = {"", ", E4M3", ", MXFP8", ", INT8"};
+            const int f_idx = cache_fmt == KVFormat::Fp16 ? 0 : cache_fmt == KVFormat::Fp8 ? 1 : cache_fmt == KVFormat::Mxfp8 ? 2 : 3;
+            std::snprintf(tag, sizeof tag, "attention_window (%s%s, %d rows at %d)", k.window ? "window" : "full", kKvNames[f_idx], R, k.p0);
             std::printf("%-46s %s\n", tag, same ? "bitwise = prepare + attention" : "FAIL");
             failures += !same;
-            if (kv == kI8) {
+            if (cache_fmt == KVFormat::Int8) {
                 bool pad = true;
                 for (const void* c : {pa[1].k_cache, pa[1].v_cache}) {
                     const std::vector<uint8_t> b = host((const uint8_t*) c, kvb);
                     for (int r = 0; r < R; ++r)
                         for (int h = 0; h < kKvHeads; ++h)
-                            for (size_t x = kHeadDim + 4; x < kv_bytes(kv); ++x)
-                                pad = pad && b[((size_t) (pos[r] % k.cap) * kKvHeads + h) * kv_bytes(kv) + x] == 0;
+                            for (size_t x = kHeadDim + 4; x < head_code_bytes(KVFormat::Int8); ++x)
+                                pad = pad && b[((size_t) (pos[r] % k.cap) * kKvHeads + h) * head_code_bytes(KVFormat::Int8) + x] == 0;
                 }
                 std::printf("%-46s %s\n", "  the written rows' padding zeroed", pad ? "ok" : "FAIL");
                 failures += !pad;
@@ -1032,21 +1167,21 @@ void test_attention_window() {
             std::vector<uint8_t> all = host((uint8_t*) aa[1].q8, q8b);
             for (const void* c : {pa[1].k_cache, pa[1].v_cache}) {
                 std::vector<uint8_t> b = host((const uint8_t*) c, kvb);
-                if (kv == kI8)   // the hash covers codes and scales: the padding is checked above
+                if (cache_fmt == KVFormat::Int8)   // the hash covers codes and scales: the padding is checked above
                     for (size_t i = 0; i < b.size(); ++i)
-                        if (i % kv_bytes(kv) >= kHeadDim + 4) b[i] = 0;
+                        if (i % head_code_bytes(KVFormat::Int8) >= kHeadDim + 4) b[i] = 0;
                 all.insert(all.end(), b.begin(), b.end());
             }
             print_hash("q8_1 output and caches", all);
             if (k.window && R == 1) {
                 std::printf("  %.1f us a call (1 row, 1 key, fused)  %.1f us (prepare + attention)%s\n",
                             time_us([&] { attention_window(pa[1], aa[1], 1, max_keys, scr, nullptr); }),
-                            time_us([&] { decode_prepare(pa[0], 1, nullptr); attention_decode(aa[0], 1, max_keys, scr, nullptr, nullptr); }), kv_tag(kv));
+                            time_us([&] { decode_prepare(pa[0], 1, nullptr); attention_decode(aa[0], 1, max_keys, scr, nullptr, nullptr); }), kKvNames[f_idx]);
             }
             if (k.window && R == 3) {
                 std::printf("  %.1f us a call (1 row, 301 keys, fused)  %.1f us (prepare + attention)%s\n",
                             time_us([&] { attention_window(pa[1], aa[1], 1, max_keys, scr, nullptr); }),
-                            time_us([&] { decode_prepare(pa[0], 1, nullptr); attention_decode(aa[0], 1, max_keys, scr, nullptr, nullptr); }), kv_tag(kv));
+                            time_us([&] { decode_prepare(pa[0], 1, nullptr); attention_decode(aa[0], 1, max_keys, scr, nullptr, nullptr); }), kKvNames[f_idx]);
             }
         }
 }
@@ -1800,18 +1935,25 @@ void test_batch_window() {
         for (int t = 0; t < segs[i].T; ++t) pos[row0[i] + t] = segs[i].p0 + t;
     int* dpos = dev(pos);
     const size_t q8_row = (size_t) kHeads * kHeadDim / 32 * 36;
-    for (const Kv kv : kAllKv)
+    for (const KVFormat fmt : {KVFormat::Fp16, KVFormat::Fp8, KVFormat::Int8, KVFormat::Mxfp8})
         for (bool window : {true, false}) {
+            // window visits keep the engine's effective ring format (fp16, unit-scale fp8, or int8); full visits take the mode's
+            const KVFormat ring_fmt = fmt == KVFormat::Fp16 ? KVFormat::Fp16
+                                      : fmt == KVFormat::Int8 ? KVFormat::Int8 : KVFormat::Fp8;
+            const KVFormat cache_fmt = window ? ring_fmt : fmt;
             const int64_t cap = window ? kExtent + 8 : 4096;
-            const size_t kvb = (size_t) kKvHeads * cap * kv_bytes(kv), ringb = (size_t) kConvRing * 1024;
+            const size_t n_kv = (size_t) kKvHeads * cap * kHeadDim, ringb = (size_t) kConvRing * 1024;
             std::vector<std::vector<uint8_t>> kc(S), vc(S);
             std::vector<std::vector<float>> kr(S), vr(S);
             for (int i = 0; i < S; ++i) {
-                kc[i] = kv_rows(kv, (size_t) kKvHeads * cap, 0.6f);
-                vc[i] = kv_rows(kv, (size_t) kKvHeads * cap, 1.0f);
+                std::vector<float> ksrc(n_kv), vsrc(n_kv);
+                for (size_t j = 0; j < n_kv; ++j) { ksrc[j] = randn(1, 0.6f)[0]; vsrc[j] = randn(1, 1.0f)[0]; }
+                kc[i] = build_full_cache(cache_fmt, ksrc, cap);
+                vc[i] = build_full_cache(cache_fmt, vsrc, cap);
                 kr[i] = randn(ringb, 2.0f);
                 vr[i] = randn(ringb, 0.6f);
             }
+            const size_t kvb = kc[0].size();
             const std::vector<float> y = randn((size_t) R * kProj, 1.5f);
             const std::vector<float> tk = randn(1024 * kConv, 0.3f), tv = randn(1024 * kConv, 0.3f);
             const std::vector<float> qs = randn(kHeads * kHeadDim, 0.2f, 1.f), rsc = randn(kHeads * kRel, 0.2f, 1.f);
@@ -1821,8 +1963,7 @@ void test_batch_window() {
                 AttnPrep a;
                 a.yq = dy + (size_t) r0 * kProj; a.yk = a.yq + kProjQ; a.yv = a.yq + kProjQ + kProjKV; a.ldq = a.ldk = a.ldv = kProj;
                 a.pos = p; a.full = !window; a.k_conv = dev(tk); a.v_conv = dev(tv); a.q_scale = dev(qs); a.r_scale = dev(rsc);
-                a.cap = cap;
-                kv_set(kv, a);
+                a.cap = cap; a.format = cache_fmt;
                 a.q = zeros<float>((size_t) rows * kHeads * kHeadDim); a.r = zeros<float>((size_t) rows * kHeads * kRel);
                 a.sink = zeros<float>((size_t) rows * kHeads);
                 return a;
@@ -1830,9 +1971,7 @@ void test_batch_window() {
             const auto args_of = [&](const AttnPrep& p, int rows) {
                 AttnArgs a;
                 a.q = p.q; a.r = p.r; a.sink = p.sink; a.rel_table = dev(table); a.pos = p.pos; a.k_cache = p.k_cache; a.v_cache = p.v_cache;
-                a.cap = cap;
-                kv_set(kv, a);
-                a.window = window ? kExtent : 0; a.gate = p.yq + kOffGate; a.gate_ld = kProj;
+                a.cap = cap; a.format = cache_fmt; a.window = window ? kExtent : 0; a.gate = p.yq + kOffGate; a.gate_ld = kProj;
                 a.q8 = zeros<uint8_t>((size_t) rows * q8_row);
                 return a;
             };
@@ -1873,7 +2012,8 @@ void test_batch_window() {
                        host(ps[i].k_ring, ringb) == host(pb.seg.c[i].k_ring, ringb) && host(ps[i].v_ring, ringb) == host(pb.seg.c[i].v_ring, ringb);
             }
             char tag[96];
-            std::snprintf(tag, sizeof tag, "batch window: attention (%s%s)", window ? "window" : "full", kv_tag(kv));
+            const char* batch_tag = cache_fmt == KVFormat::Fp16 ? "" : cache_fmt == KVFormat::Fp8 ? ", E4M3" : cache_fmt == KVFormat::Int8 ? ", INT8" : ", MXFP8";
+            std::snprintf(tag, sizeof tag, "batch window: attention (%s%s)", window ? "window" : "full", batch_tag);
             std::printf("%-46s %s\n", tag, same ? "bitwise = each conversation alone" : "FAIL");
             failures += !same;
             print_hash("q8_1 output", q8b);

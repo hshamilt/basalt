@@ -9,6 +9,7 @@
 // them to the q8_1 blocks of the output projection.
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/kernels/q8_1_finite.hpp"
+#include "basalt/models/inkling2/kv_row_codec.hpp"
 #include "basalt/models/inkling2/kernels.hpp"
 #include "prep.cuh"
 
@@ -122,19 +123,22 @@ __device__ __forceinline__ void row_scales(const uint8_t* row, float (&s)[2]) {
     s[1] = __high2float(h);
 }
 
+template <KVFormat F>
 struct Smem {
     float q[kGroup][kHeadDim];
     float rs[kGroup][kRel];
     uint32_t v[kWarps][kTile][kVStride];   // a tile's value rows as fp16 pairs
     float m[kWarps][kGroup], l[kWarps][kGroup];
     float acc[kWarps][kGroup][kHeadDim];
+    // the tile's rows' MXFP8 group scales (4 bytes a row); fp16/E4M3 rows are unit-scale and carry none
+    uint8_t vsc[kWarps][kTile][F == KVFormat::Mxfp8 ? kMxfp8Groups : 1];
 };
 
-template <bool FP8, bool INT8>
+template <KVFormat F>
 __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int z, float* __restrict__ part_ml,
                                                                  float* __restrict__ part_acc) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
-    Smem& sm = *reinterpret_cast<Smem*>(smem_raw);
+    Smem<F>& sm = *reinterpret_cast<Smem<F>*>(smem_raw);
     const int r = blockIdx.x, g = blockIdx.y, s = blockIdx.z;
     const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
     bk::pdl_wait();
@@ -144,26 +148,36 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int
     const int span = span_of(n);
     if (s * span >= n) return;   // past this row's slices
     const int s_lo = lo + s * span, s_hi = min(p + 1, s_lo + span);
-    constexpr int kRowBytes = FP8 ? kHeadDim : INT8 ? kKvInt8RowBytes : kHeadDim * 2;
-    constexpr int kLoads = (FP8 || INT8) ? kHeadDim / 16 : kHeadDim / 8;
+    constexpr int kRowBytes = F == KVFormat::Fp16 ? kHeadDim * 2 : F == KVFormat::Int8 ? kKvInt8RowBytes : kHeadDim;
+    constexpr int kLoads = F == KVFormat::Fp16 ? kHeadDim / 8 : kHeadDim / 16;
     const SegCaches& sc = a.seg.c[bk::seg_of(a.seg.at, r)];   // a batch window's row: its conversation's caches
     const uint8_t* kbase = static_cast<const uint8_t*>(a.seg.at.n > 0 ? sc.k : a.k_cache) + (size_t) g * kRowBytes;
     const uint8_t* vbase = static_cast<const uint8_t*>(a.seg.at.n > 0 ? sc.v : a.v_cache) + (size_t) g * kRowBytes;
+    const uint8_t* kscales = static_cast<const uint8_t*>(a.seg.at.n > 0 ? sc.k : a.k_cache) + code_bytes(F) + 4 * g;
+    const uint8_t* vscales = static_cast<const uint8_t*>(a.seg.at.n > 0 ? sc.v : a.v_cache) + code_bytes(F) + 4 * g;
     // a tile's key and value rows, the lane's key's (zero past the slice); the warp's first tile is loaded with the queries
-    const auto load_tile = [&](int t0, uint4 (&kr)[kLoads], uint4 (&vr)[kLoads], float (&ks)[2], float (&vs)[2]) {
+    uint8_t ke[4] = {0, 0, 0, 0}, ve[4] = {0, 0, 0, 0};
+    float ks[2] = {1.f, 1.f}, vs[2] = {1.f, 1.f};
+    const auto load_tile = [&](int t0, uint4 (&kr)[kLoads], uint4 (&vr)[kLoads]) {
         const int key = t0 + lane;
         ks[0] = ks[1] = vs[0] = vs[1] = 1.f;
+        ke[0] = ke[1] = ke[2] = ke[3] = ve[0] = ve[1] = ve[2] = ve[3] = 0;
         if (key < s_hi) {
-            const size_t cell = (size_t) (key % a.cap) * kKvHeads * kRowBytes;
+            const size_t cell = (size_t) (key % a.cap) * cell_bytes(F);
             const uint4* kp = reinterpret_cast<const uint4*>(kbase + cell);
             const uint4* vp = reinterpret_cast<const uint4*>(vbase + cell);
 #pragma unroll
             for (int i = 0; i < kLoads; ++i) kr[i] = kp[i];
 #pragma unroll
             for (int i = 0; i < kLoads; ++i) vr[i] = vp[i];
-            if constexpr (INT8) {
+            if constexpr (F == KVFormat::Int8) {
                 row_scales(kbase + cell, ks);
                 row_scales(vbase + cell, vs);
+            } else if constexpr (F == KVFormat::Mxfp8) {
+                const uint8_t* ksp = kscales + cell;
+                const uint8_t* vsp = vscales + cell;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) { ke[j] = ksp[j]; ve[j] = vsp[j]; }
             }
         } else {
 #pragma unroll
@@ -172,8 +186,7 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int
     };
     const int t_first = s_lo + w * kTile;
     uint4 kr[kLoads], vr[kLoads];
-    float ks[2], vs[2];
-    if (t_first < s_hi) load_tile(t_first, kr, vr, ks, vs);
+    if (t_first < s_hi) load_tile(t_first, kr, vr);
     for (int i = threadIdx.x; i < kGroup * kHeadDim; i += blockDim.x)
         sm.q[i / kHeadDim][i % kHeadDim] = a.q[((size_t) r * kHeads + g * kGroup) * kHeadDim + i];
     for (int i = threadIdx.x; i < kGroup * kRel; i += blockDim.x)
@@ -190,26 +203,27 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int
     for (int t0 = t_first; t0 < s_hi; t0 += kUnit) {
         const int key = t0 + lane;
         const bool valid = key < s_hi;
-        if (t0 != t_first) load_tile(t0, kr, vr, ks, vs);
+        if (t0 != t_first) load_tile(t0, kr, vr);
         // the lane's key scored for the three heads
         float sc[kGroup] = {0.f, 0.f, 0.f};
 #pragma unroll
         for (int i = 0; i < kLoads; ++i) {
-            if constexpr (FP8 || INT8) {
-                float f[16];
-                if constexpr (FP8) unpack16_fp8(kr[i], f);
-                else unpack16_int8(kr[i], ks[i / 4], f);
-#pragma unroll
-                for (int d = 0; d < 16; ++d)
-#pragma unroll
-                    for (int h = 0; h < kGroup; ++h) sc[h] = fmaf(sm.q[h][16 * i + d], f[d], sc[h]);
-            } else {
+            if constexpr (F == KVFormat::Fp16) {
                 float f[8];
                 unpack8_f16(kr[i], f);
 #pragma unroll
                 for (int d = 0; d < 8; ++d)
 #pragma unroll
                     for (int h = 0; h < kGroup; ++h) sc[h] = fmaf(sm.q[h][8 * i + d], f[d], sc[h]);
+            } else {
+                float f[16];
+                if constexpr (F == KVFormat::Fp8) unpack16_fp8(kr[i], f);
+                else if constexpr (F == KVFormat::Int8) unpack16_int8(kr[i], ks[i / 4], f);
+                else mxfp8_decode16(kr[i], mxfp8_scale_factor(ke[i >> 1]), f);
+#pragma unroll
+                for (int d = 0; d < 16; ++d)
+#pragma unroll
+                    for (int h = 0; h < kGroup; ++h) sc[h] = fmaf(sm.q[h][16 * i + d], f[d], sc[h]);
             }
         }
         const int dist = p - key;
@@ -223,9 +237,13 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int
             for (int i = 0; i < kRel; ++i) b = fmaf(sm.rs[h][i], tv[i], b);
             sc[h] = valid ? sc[h] * a.scale + b : -INFINITY;
         }
-        // the lane's value row into shared memory as fp16 pairs (E4M3 is exact in fp16)
+        // the lane's value row into shared memory as fp16 pairs (E4M3 is exact in fp16); the MXFP8 group scale is
+        // applied in the accumulate step, so the shared row is the codes as for unit-scale E4M3
         uint32_t* vrow = sm.v[w][lane];
-        if constexpr (INT8) {
+        if constexpr (F == KVFormat::Fp16) {
+#pragma unroll
+            for (int i = 0; i < kLoads; ++i) *reinterpret_cast<uint4*>(vrow + 4 * i) = vr[i];
+        } else if constexpr (F == KVFormat::Int8) {
 #pragma unroll
             for (int i = 0; i < kLoads; ++i) {
                 uint32_t h[8];
@@ -233,7 +251,7 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int
 #pragma unroll
                 for (int d = 0; d < 8; ++d) vrow[8 * i + d] = h[d];
             }
-        } else if constexpr (FP8) {
+        } else {   // fp8 and mxfp8
 #pragma unroll
             for (int i = 0; i < kLoads; ++i) {
                 float f[16];
@@ -244,9 +262,10 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int
                     vrow[8 * i + d] = *reinterpret_cast<const uint32_t*>(&hv);
                 }
             }
-        } else {
+            if constexpr (F == KVFormat::Mxfp8) {   // the row's group scales: the accumulate applies them (the shared row is the codes)
 #pragma unroll
-            for (int i = 0; i < kLoads; ++i) *reinterpret_cast<uint4*>(vrow + 4 * i) = vr[i];
+                for (int j = 0; j < 4; ++j) sm.vsc[w][lane][j] = ve[j];
+            }
         }
         // the online softmax over the tile
         float pr[kGroup];
@@ -264,8 +283,12 @@ __global__ void __launch_bounds__(kWarps * 32) attn_split_kernel(AttnArgs a, int
         __syncwarp();
         for (int j = 0; j < kTile; ++j) {
             const uint2 u = *reinterpret_cast<const uint2*>(&sm.v[w][j][lane * 2]);
-            const float2 v01 = __half22float2(*reinterpret_cast<const __half2*>(&u.x));
-            const float2 v23 = __half22float2(*reinterpret_cast<const __half2*>(&u.y));
+            float2 v01 = __half22float2(*reinterpret_cast<const __half2*>(&u.x));
+            float2 v23 = __half22float2(*reinterpret_cast<const __half2*>(&u.y));
+            if constexpr (F == KVFormat::Mxfp8) {
+                const float scale = mxfp8_scale_factor(sm.vsc[w][j][lane >> 3]);
+                v01.x *= scale; v01.y *= scale; v23.x *= scale; v23.y *= scale;
+            }
 #pragma unroll
             for (int h = 0; h < kGroup; ++h) {
                 const float pj = __shfl_sync(0xffffffffu, pr[h], j);
@@ -359,25 +382,31 @@ constexpr int kClusterSplits = 8;
 constexpr int kFusedRows = 3;
 
 // ROWS: the window rows a block may prepare (2 for windows of 1-2 rows, 3 for 3)
-template <int ROWS>
+// One row of a fresh cache row in the cache's format, codes first (fp16: 128 halfs, E4M3/MXFP8: 128 codes) and, for
+// MXFP8, the four group scales after them. Fresh rows are staged per block and read from it after the barrier; the
+// block whose own row is in its slice writes the same bytes into the cache and the rings.
+template <int ROWS, KVFormat F>
 struct FusedSmem {
-    Smem s;
-    alignas(16) uint8_t kw[ROWS][kHeadDim * 2];   // the window's rows' keys in the cache's format (fp16 or E4M3)
-    alignas(16) uint8_t vw[ROWS][kHeadDim * 2];
+    Smem<F> s;
+    alignas(16) uint8_t kw[ROWS][head_code_bytes(F)];
+    alignas(16) uint8_t vw[ROWS][head_code_bytes(F)];
+    // the window's rows' MXFP8 group scales, [4] per row (fp16/E4M3: unused)
+    alignas(4) uint8_t ke[ROWS][F == KVFormat::Mxfp8 ? kMxfp8Groups : 1];
+    alignas(4) uint8_t ve[ROWS][F == KVFormat::Mxfp8 ? kMxfp8Groups : 1];
     float pm[kGroup], pl[kGroup];                 // the slice's merged maximum and sum of each head
     float pacc[kGroup][kHeadDim];
 };
 
-template <bool FP8, bool INT8, int ROWS>
+template <KVFormat F, int ROWS>
 __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps * 32) attn_fused_kernel(AttnPrep pa, AttnArgs a) {
     namespace cg = cooperative_groups;
     extern __shared__ __align__(16) unsigned char smem_raw[];
-    FusedSmem<ROWS>& fs = *reinterpret_cast<FusedSmem<ROWS>*>(smem_raw);
-    Smem& sm = fs.s;
+    FusedSmem<ROWS, F>& fs = *reinterpret_cast<FusedSmem<ROWS, F>*>(smem_raw);
+    Smem<F>& sm = fs.s;
     const int r = blockIdx.x, g = blockIdx.y, s = blockIdx.z;
     const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    constexpr int kRowBytes = FP8 ? kHeadDim : INT8 ? kKvInt8RowBytes : kHeadDim * 2;
-    constexpr int kLoads = (FP8 || INT8) ? kHeadDim / 16 : kHeadDim / 8;
+    constexpr int kRowBytes = F == KVFormat::Fp16 ? kHeadDim * 2 : F == KVFormat::Int8 ? kKvInt8RowBytes : kHeadDim;
+    constexpr int kLoads = F == KVFormat::Fp16 ? kHeadDim / 8 : kHeadDim / 16;
     // before the wait: the positions (staged before the window), the slice, the warp's tile and what of it is older than
     // the window, and the weights
     int p, lo, n;
@@ -390,17 +419,25 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
     const bool valid = active && key < s_hi;
     const uint8_t* kbase = static_cast<const uint8_t*>(a.k_cache) + (size_t) g * kRowBytes;
     const uint8_t* vbase = static_cast<const uint8_t*>(a.v_cache) + (size_t) g * kRowBytes;
+    const uint8_t* kscales = static_cast<const uint8_t*>(a.k_cache) + code_bytes(F) + 4 * g;
+    const uint8_t* vscales = static_cast<const uint8_t*>(a.v_cache) + code_bytes(F) + 4 * g;
     uint4 kr[kLoads], vr[kLoads];
+    uint8_t ke[4] = {0, 0, 0, 0}, ve[4] = {0, 0, 0, 0};
     float ks[2] = {1.f, 1.f}, vs[2] = {1.f, 1.f};
     if (valid && key < p0) {
-        const size_t cell = (size_t) (key % a.cap) * kKvHeads * kRowBytes;
+        const size_t cell = (size_t) (key % a.cap) * cell_bytes(F);
 #pragma unroll
         for (int i = 0; i < kLoads; ++i) kr[i] = reinterpret_cast<const uint4*>(kbase + cell)[i];
 #pragma unroll
         for (int i = 0; i < kLoads; ++i) vr[i] = reinterpret_cast<const uint4*>(vbase + cell)[i];
-        if constexpr (INT8) {
+        if constexpr (F == KVFormat::Int8) {
             row_scales(kbase + cell, ks);
             row_scales(vbase + cell, vs);
+        } else if constexpr (F == KVFormat::Mxfp8) {
+            const uint8_t* ksp = kscales + cell;
+            const uint8_t* vsp = vscales + cell;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) { ke[j] = ksp[j]; ve[j] = vsp[j]; }
         }
     } else {
 #pragma unroll
@@ -434,15 +471,45 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
                 for (int k = 0; k < ROWS; ++k) {
                     if (k >= nr) break;
                     const int rr = rr0 + k;
+                    float vals[4] = {val[k][0] * f[k], val[k][1] * f[k], val[k][2] * f[k], val[k][3] * f[k]};
                     uint8_t* row = w ? fs.vw[rr] : fs.kw[rr];
+                    uint8_t* es = w ? fs.ve[rr] : fs.ke[rr];
+                    if constexpr (F == KVFormat::Fp16) {
 #pragma unroll
-                    for (int u = 0; u < 4; ++u) prep::store_kv(row, FP8, INT8, (size_t) lane * 4 + u, val[k][u] * f[k], scale[k], lane);
+                        for (int u = 0; u < 4; ++u) prep::store_kv<F>(row, lane * 8 + u * 2, vals[u]);
+                    } else if constexpr (F == KVFormat::Fp8) {
+#pragma unroll
+                        for (int u = 0; u < 4; ++u) prep::store_kv<F>(row, lane * 4 + u, vals[u]);
+                    } else if constexpr (F == KVFormat::Int8) {
+#pragma unroll
+                        for (int u = 0; u < 4; ++u)
+                            prep::store_kv<KVFormat::Int8>(row, (size_t) lane * 4 + u, vals[u], scale[k], lane);
+                    } else {
+                        mxfp8_encode_row(vals, row, es, lane);
+                    }
                     if (rr == r) {   // the block's own row: into the cache and the ring
                         void* cache = w ? pa.v_cache : pa.k_cache;
-                        const size_t row_bytes = (size_t) kRowBytes;
-                        void* cache_row = static_cast<uint8_t*>(cache) + ((size_t) (p % pa.cap) * kKvHeads + g) * row_bytes;
+                        if constexpr (F == KVFormat::Fp16) {
+                            const size_t cell = (size_t) (p % pa.cap) * cell_bytes(F) + (size_t) g * head_code_bytes(F);
 #pragma unroll
-                        for (int u = 0; u < 4; ++u) prep::store_kv(cache_row, FP8, INT8, (size_t) lane * 4 + u, val[k][u] * f[k], scale[k], lane);
+                            for (int u = 0; u < 4; ++u) prep::store_kv<F>(cache, cell + lane * 8 + u * 2, vals[u]);
+                        } else if constexpr (F == KVFormat::Fp8) {
+                            const size_t cell = (size_t) (p % pa.cap) * cell_bytes(F) + (size_t) g * head_code_bytes(F);
+#pragma unroll
+                            for (int u = 0; u < 4; ++u) prep::store_kv<F>(cache, cell + lane * 4 + u, vals[u]);
+                        } else if constexpr (F == KVFormat::Int8) {
+                            const size_t cache_row = (size_t) (p % pa.cap) * kKvHeads * (size_t) kRowBytes + (size_t) g * kRowBytes;
+#pragma unroll
+                            for (int u = 0; u < 4; ++u)
+                                prep::store_kv<KVFormat::Int8>(static_cast<uint8_t*>(cache) + cache_row, (size_t) lane * 4 + u, vals[u], scale[k], lane);
+                        } else {   // the fresh row's bytes: the same encode, reused for the cache write
+                            const size_t cell = (size_t) (p % pa.cap) * cell_bytes(F) + (size_t) g * head_code_bytes(F);
+                            *reinterpret_cast<uint32_t*>((uint8_t*) cache + cell + lane * 4) =
+                            *reinterpret_cast<const uint32_t*>(row + lane * 4);
+                            if ((lane & 7) == 0) {
+                                *((uint8_t*) cache + (size_t) (p % pa.cap) * cell_bytes(F) + code_bytes(F) + 4 * g + (lane >> 3)) = es[lane >> 3];
+                            }
+                        }
                         float* ring = w ? pa.v_ring : pa.k_ring;
                         *reinterpret_cast<float4*>(ring + (size_t) (p % kConvRing) * (kKvHeads * kHeadDim) + g * kHeadDim + lane * 4) =
                             make_float4(raw[k][0], raw[k][1], raw[k][2], raw[k][3]);
@@ -463,9 +530,14 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
             for (int i = 0; i < kLoads; ++i) kr[i] = kp[i];
 #pragma unroll
             for (int i = 0; i < kLoads; ++i) vr[i] = vp[i];
-            if constexpr (INT8) {
+            if constexpr (F == KVFormat::Int8) {
                 row_scales(fs.kw[key - p0], ks);
                 row_scales(fs.vw[key - p0], vs);
+            } else if constexpr (F == KVFormat::Mxfp8) {
+                const uint8_t* ksp = fs.ke[key - p0];
+                const uint8_t* vsp = fs.ve[key - p0];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) { ke[j] = ksp[j]; ve[j] = vsp[j]; }
             }
         }
         float m[kGroup], l[kGroup], acc[kGroup][4];
@@ -480,21 +552,22 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
             float sc[kGroup] = {0.f, 0.f, 0.f};
 #pragma unroll
             for (int i = 0; i < kLoads; ++i) {
-                if constexpr (FP8 || INT8) {
-                    float f[16];
-                    if constexpr (FP8) unpack16_fp8(kr[i], f);
-                    else unpack16_int8(kr[i], ks[i / 4], f);
-#pragma unroll
-                    for (int d = 0; d < 16; ++d)
-#pragma unroll
-                        for (int h = 0; h < kGroup; ++h) sc[h] = fmaf(sm.q[h][16 * i + d], f[d], sc[h]);
-                } else {
+                if constexpr (F == KVFormat::Fp16) {
                     float f[8];
                     unpack8_f16(kr[i], f);
 #pragma unroll
                     for (int d = 0; d < 8; ++d)
 #pragma unroll
                         for (int h = 0; h < kGroup; ++h) sc[h] = fmaf(sm.q[h][8 * i + d], f[d], sc[h]);
+                } else {
+                    float f[16];
+                    if constexpr (F == KVFormat::Fp8) unpack16_fp8(kr[i], f);
+                    else if constexpr (F == KVFormat::Int8) unpack16_int8(kr[i], ks[i / 4], f);
+                    else mxfp8_decode16(kr[i], mxfp8_scale_factor(ke[i >> 1]), f);
+#pragma unroll
+                    for (int d = 0; d < 16; ++d)
+#pragma unroll
+                        for (int h = 0; h < kGroup; ++h) sc[h] = fmaf(sm.q[h][16 * i + d], f[d], sc[h]);
                 }
             }
 #pragma unroll
@@ -505,7 +578,9 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
                 sc[h] = valid ? sc[h] * a.scale + b : -INFINITY;
             }
             uint32_t* vrow = sm.v[w][lane];
-            if constexpr (INT8) {
+            if constexpr (F == KVFormat::Fp16) {
+                for (int i = 0; i < kLoads; ++i) *reinterpret_cast<uint4*>(vrow + 4 * i) = vr[i];
+            } else if constexpr (F == KVFormat::Int8) {
 #pragma unroll
                 for (int i = 0; i < kLoads; ++i) {
                     uint32_t h[8];
@@ -513,7 +588,7 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
 #pragma unroll
                     for (int d = 0; d < 8; ++d) vrow[8 * i + d] = h[d];
                 }
-            } else if constexpr (FP8) {
+            } else {   // fp8 and mxfp8
 #pragma unroll
                 for (int i = 0; i < kLoads; ++i) {
                     float f[16];
@@ -524,9 +599,10 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
                         vrow[8 * i + d] = *reinterpret_cast<const uint32_t*>(&hv);
                     }
                 }
-            } else {
+                if constexpr (F == KVFormat::Mxfp8) {
 #pragma unroll
-                for (int i = 0; i < kLoads; ++i) *reinterpret_cast<uint4*>(vrow + 4 * i) = vr[i];
+                    for (int j = 0; j < 4; ++j) sm.vsc[w][lane][j] = ve[j];
+                }
             }
             float pr[kGroup];
 #pragma unroll
@@ -543,8 +619,12 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
             __syncwarp();
             for (int j = 0; j < kTile; ++j) {
                 const uint2 u = *reinterpret_cast<const uint2*>(&sm.v[w][j][lane * 2]);
-                const float2 v01 = __half22float2(*reinterpret_cast<const __half2*>(&u.x));
-                const float2 v23 = __half22float2(*reinterpret_cast<const __half2*>(&u.y));
+                float2 v01 = __half22float2(*reinterpret_cast<const __half2*>(&u.x));
+                float2 v23 = __half22float2(*reinterpret_cast<const __half2*>(&u.y));
+                if constexpr (F == KVFormat::Mxfp8) {
+                    const float scale = mxfp8_scale_factor(sm.vsc[w][j][lane >> 3]);
+                    v01.x *= scale; v01.y *= scale; v23.x *= scale; v23.y *= scale;
+                }
 #pragma unroll
                 for (int h = 0; h < kGroup; ++h) {
                     const float pj = __shfl_sync(0xffffffffu, pr[h], j);
@@ -598,7 +678,7 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
 #pragma unroll
         for (int q = 0; q < kClusterSplits; ++q)
             if (q < splits) {
-                const FusedSmem<ROWS>* part = cluster.map_shared_rank(&fs, q);
+                const FusedSmem<ROWS, F>* part = cluster.map_shared_rank(&fs, q);
                 pm[q] = part->pm[h];
                 pl[q] = part->pl[h];
                 pv[q] = part->pacc[h][d];
@@ -656,16 +736,20 @@ void attention_decode(const AttnArgs& a, int rows, int64_t max_keys, void* scrat
     float* part_acc = part_ml + (size_t) rows * kHeads * z * 2;
     static bool attr[kOptInDevices] = {};   // the opt-in is per device: a layer split launches these on two cards
     if (bool& set = attr[opt_in_device()]; !set) {
-        cudaFuncSetAttribute(attn_split_kernel<false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
-        cudaFuncSetAttribute(attn_split_kernel<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
-        cudaFuncSetAttribute(attn_split_kernel<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem));
+        cudaFuncSetAttribute(attn_split_kernel<KVFormat::Fp16>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem<KVFormat::Fp16>));
+        cudaFuncSetAttribute(attn_split_kernel<KVFormat::Fp8>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem<KVFormat::Fp8>));
+        cudaFuncSetAttribute(attn_split_kernel<KVFormat::Int8>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem<KVFormat::Int8>));
+        cudaFuncSetAttribute(attn_split_kernel<KVFormat::Mxfp8>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(Smem<KVFormat::Mxfp8>));
         set = true;
 
     }
     const dim3 grid((unsigned) rows, kKvHeads, (unsigned) z);
-    if (a.int8) bk::launch_pdl(attn_split_kernel<false, true>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
-    else if (a.fp8) bk::launch_pdl(attn_split_kernel<true, false>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
-    else bk::launch_pdl(attn_split_kernel<false, false>, grid, dim3(kWarps * 32), sizeof(Smem), s, a, z, part_ml, part_acc);
+    switch (a.format) {
+    case KVFormat::Fp16:  bk::launch_pdl(attn_split_kernel<KVFormat::Fp16>, grid, dim3(kWarps * 32), sizeof(Smem<KVFormat::Fp16>), s, a, z, part_ml, part_acc); break;
+    case KVFormat::Fp8:   bk::launch_pdl(attn_split_kernel<KVFormat::Fp8>, grid, dim3(kWarps * 32), sizeof(Smem<KVFormat::Fp8>), s, a, z, part_ml, part_acc); break;
+    case KVFormat::Int8:  bk::launch_pdl(attn_split_kernel<KVFormat::Int8>, grid, dim3(kWarps * 32), sizeof(Smem<KVFormat::Int8>), s, a, z, part_ml, part_acc); break;
+    case KVFormat::Mxfp8: bk::launch_pdl(attn_split_kernel<KVFormat::Mxfp8>, grid, dim3(kWarps * 32), sizeof(Smem<KVFormat::Mxfp8>), s, a, z, part_ml, part_acc); break;
+    }
     check("attention_decode");
     bk::launch_pdl(attn_combine_kernel, dim3((unsigned) rows, kHeads), dim3(kHeadDim), 0, s, a, z, (const float*) part_ml, (const float*) part_acc, out);
     check("attention_decode/combine");
@@ -688,24 +772,28 @@ void attention_window(const AttnPrep& pa, const AttnArgs& a, int rows, int64_t m
         int per_sm = 0, reserved = 0;
         cudaDeviceGetAttribute(&per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev);
         cudaDeviceGetAttribute(&reserved, cudaDevAttrReservedSharedMemoryPerBlock, dev);
-        smem = std::max(sizeof(FusedSmem<2>), (size_t) std::max(0, per_sm / 2 - reserved + 128));
-        cudaFuncSetAttribute(attn_fused_kernel<false, false, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
-        cudaFuncSetAttribute(attn_fused_kernel<true, false, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
-        cudaFuncSetAttribute(attn_fused_kernel<false, true, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
-        cudaFuncSetAttribute(attn_fused_kernel<false, false, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(FusedSmem<3>));
-        cudaFuncSetAttribute(attn_fused_kernel<true, false, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(FusedSmem<3>));
-        cudaFuncSetAttribute(attn_fused_kernel<false, true, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(FusedSmem<3>));
+        smem = std::max(sizeof(FusedSmem<2, KVFormat::Fp16>), (size_t) std::max(0, per_sm / 2 - reserved + 128));
+        cudaFuncSetAttribute(attn_fused_kernel<KVFormat::Fp16, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        cudaFuncSetAttribute(attn_fused_kernel<KVFormat::Fp8, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        cudaFuncSetAttribute(attn_fused_kernel<KVFormat::Int8, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        cudaFuncSetAttribute(attn_fused_kernel<KVFormat::Mxfp8, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        cudaFuncSetAttribute(attn_fused_kernel<KVFormat::Fp16, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(FusedSmem<3, KVFormat::Fp16>));
+        cudaFuncSetAttribute(attn_fused_kernel<KVFormat::Fp8, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(FusedSmem<3, KVFormat::Fp8>));
+        cudaFuncSetAttribute(attn_fused_kernel<KVFormat::Int8, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(FusedSmem<3, KVFormat::Int8>));
+        cudaFuncSetAttribute(attn_fused_kernel<KVFormat::Mxfp8, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) sizeof(FusedSmem<3, KVFormat::Mxfp8>));
     }
     const dim3 grid((unsigned) rows, kKvHeads, kClusterSplits);
     cudaStream_t s = (cudaStream_t) stream;
     if (rows <= 2) {
-        if (a.int8) bk::launch_pdl(attn_fused_kernel<false, true, 2>, grid, dim3(kWarps * 32), smem, s, pa, a);
-        else if (a.fp8) bk::launch_pdl(attn_fused_kernel<true, false, 2>, grid, dim3(kWarps * 32), smem, s, pa, a);
-        else bk::launch_pdl(attn_fused_kernel<false, false, 2>, grid, dim3(kWarps * 32), smem, s, pa, a);
+        if (a.format == KVFormat::Fp16) bk::launch_pdl(attn_fused_kernel<KVFormat::Fp16, 2>, grid, dim3(kWarps * 32), smem, s, pa, a);
+        else if (a.format == KVFormat::Fp8) bk::launch_pdl(attn_fused_kernel<KVFormat::Fp8, 2>, grid, dim3(kWarps * 32), smem, s, pa, a);
+        else if (a.format == KVFormat::Int8) bk::launch_pdl(attn_fused_kernel<KVFormat::Int8, 2>, grid, dim3(kWarps * 32), smem, s, pa, a);
+        else bk::launch_pdl(attn_fused_kernel<KVFormat::Mxfp8, 2>, grid, dim3(kWarps * 32), smem, s, pa, a);
     } else {
-        if (a.int8) bk::launch_pdl(attn_fused_kernel<false, true, 3>, grid, dim3(kWarps * 32), sizeof(FusedSmem<3>), s, pa, a);
-        else if (a.fp8) bk::launch_pdl(attn_fused_kernel<true, false, 3>, grid, dim3(kWarps * 32), sizeof(FusedSmem<3>), s, pa, a);
-        else bk::launch_pdl(attn_fused_kernel<false, false, 3>, grid, dim3(kWarps * 32), sizeof(FusedSmem<3>), s, pa, a);
+        if (a.format == KVFormat::Fp16) bk::launch_pdl(attn_fused_kernel<KVFormat::Fp16, 3>, grid, dim3(kWarps * 32), sizeof(FusedSmem<3, KVFormat::Fp16>), s, pa, a);
+        else if (a.format == KVFormat::Fp8) bk::launch_pdl(attn_fused_kernel<KVFormat::Fp8, 3>, grid, dim3(kWarps * 32), sizeof(FusedSmem<3, KVFormat::Fp8>), s, pa, a);
+        else if (a.format == KVFormat::Int8) bk::launch_pdl(attn_fused_kernel<KVFormat::Int8, 3>, grid, dim3(kWarps * 32), sizeof(FusedSmem<3, KVFormat::Int8>), s, pa, a);
+        else bk::launch_pdl(attn_fused_kernel<KVFormat::Mxfp8, 3>, grid, dim3(kWarps * 32), sizeof(FusedSmem<3, KVFormat::Mxfp8>), s, pa, a);
     }
     check("attention_window");
 }
