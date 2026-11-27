@@ -640,7 +640,6 @@ model::SplitSpec InklingModel::split_spec(const model::GpuCards& c) const {
     // card already, so its room is what is free now)
     const int64_t want = req.max_context > 0 ? req.max_context : kDefaultContext;
     const uint64_t n_sess = (uint64_t) std::max(req.sessions, 1);
-    const bool fp8 = req.kv == "fp8", int8 = req.kv == "int8";
     std::vector<int> visits((size_t) g.n_layers, 0);
     for (const Visit& v : g.visits) ++visits[(size_t) v.layer];
     model::SplitSpec s;
@@ -651,9 +650,9 @@ model::SplitSpec InklingModel::split_spec(const model::GpuCards& c) const {
                                2 * prefill::q8::scale_plane_bytes(kProjKV, (int64_t) g.n_embd) +
                                prefill::q8::scale_plane_bytes((int64_t) g.n_embd, 3072);
         s.layer.push_back((uint64_t) g.n_expert * expert_stride(el.gu_type, el.blob_bytes) + dense +
-                          (uint64_t) visits[(size_t) l] * visit_cache_bytes(g, l, want, fp8, int8) * n_sess);
+                          (uint64_t) visits[(size_t) l] * visit_cache_bytes(g, l, want, kv_full_, kv_ring_) * n_sess);
     }
-    const uint64_t slot_rest = session_bytes(g, want, fp8, int8, g.n_layers, 1);   // a slot's own beyond its caches (no layer on card 1)
+    const uint64_t slot_rest = session_bytes(g, want, kv_full_, kv_ring_, g.n_layers, 1);   // a slot's own beyond its caches (no layer on card 1)
     s.fixed = {kCardSpare + shared_bytes(g, req.spec >= 2) + slot_rest * n_sess + (req.spec >= 2 ? 1000ull << 20 : 0),
                kCardSpare + shared_bytes(g, false) + slot_rest * n_sess};
     for (const model::GpuCards::Card& card : c.cards) {
