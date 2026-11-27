@@ -3,11 +3,13 @@
 // (the exact rules, written from the spec here, not from the device code).
 #include "basalt/models/inkling2/kernels.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 using namespace basalt::models::inkling2;
 
